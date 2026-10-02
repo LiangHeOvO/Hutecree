@@ -1,0 +1,2290 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  人类科技树 · 科技演化                              By.LiangHe   v0.6
+  单文件 WebGL 可视化：把人类科技史铺成九层同心球壳，随时间轴逐一点亮。
+================================================================================
+
+【文件结构】自上而下：
+  1. style 样式块           全部样式（已压缩：每个选择器占一行）
+  2. #homePage              主页面（进入页）
+  3. 场景 UI                HUD / 图例 / 时间轴 / 右上角按钮 / 详情面板 / 提示面板
+  4. 模块脚本区             全部逻辑与数据（type=module）
+  5. 末尾普通脚本           离线兜底：three.js 没能加载时给出提示
+
+【运行依赖】
+  three.js 0.160.0，通过文件顶部的 importmap 从 unpkg CDN 加载。**必须联网**。
+  离线时页面只显示提示，星云与科技树不会渲染。
+
+【数据流】—— 改动数据前务必先读这一段
+  V（前缀/中缀/后缀词库） + ERA_DEFS（九大时代手写科技名）
+        │
+        ├─ expandFuture()  给"未来时代"每门类追加 genSci() 组合出的 285 个名字
+        ├─ interleave()    时代内把七门类轮转打散；GLOBAL_DUP 做全局同名去重
+        └─ NODES           每条科技得到 appear / pos / baseSize / 自转轴 / 抖动相位
+                    │
+                    ├─ pickMajorIndices()  选出 450 项"重大成就"（更大 + 常显标签）
+                    ├─ makeUniqueDesc()    为每个节点预计算一条独一无二的简介
+                    └─ buildGeom()         打包成 GPU 顶点属性
+
+【时间轴模型】—— 整个程序的核心概念
+  eraTime 是唯一的全局时间量，单位是"时代"：
+     整数部分 = 第几个时代(0~8)      小数部分 = 该时代内的进度(0~1)
+  每个节点有一个 appear = 时代序号 + 时代内进度（由 KNOWN_YEARS 的真实年份
+  或顺序均分决定）。当 eraTime > node.appear，该科技才算"已解锁"：
+  开始出现、可点击、有标签。倍速按钮只是改变 eraTime 的推进速率。
+
+【九层球壳】
+  RADII[i] ~ RADII[i+1] 是第 i 个时代的空间体积。相机距离落在哪一层，
+  就显示那一层的重大科技标签（见 updateLabels 里的 displayEra）。
+
+【已知取舍与踩坑记录】—— 后来者请勿重复踩
+  1. 本文件从 2617 行压到 1900 余行（数据格式紧凑化 + CSS 单行化 + 删空行注释），
+     但**体积只降了 4%**：大头是内容资产（5000+ 科技名、780 条年份、
+     130 条关键词描述），压不掉，只能删内容。
+  2. 标签曾经"一抽一抽"地抽动：重叠/出界时用 hideLabel 把透明度**瞬间**归零，
+     而判定会在距离阈值附近反复穿越。**现在的铁律：透明度只由平滑量
+     item.vis 派生，任何地方都不允许再出现"当帧硬乘系数"或"瞬间归零"。**
+  3. TOL 曾是 1（标签同时显示相邻时代），同屏标签从 50 涨到 150 导致明显卡顿，
+     已退回 0。MAX_MAJOR_CANDIDATES 是配套的性能保险丝。
+  4. 重新开始时出现过"上一轮标签烙印"：清空逻辑写成 if(item.isVis) hideLabel(...)，
+     而上一轮结束时 isVis 已是 false，条件不成立就漏掉了 DOM 上的透明度。
+     **现在统一走 resetAllLabels()，它无条件隐藏所有标签。**
+  5. 星球着色器曾经**误替换了背景星空**的着色器——因为 indexOf('fragmentShader:')
+     命中的是文件里第一个（addStarLayer 里的那个）。现在按"第 N 个 fragmentShader"
+     定位，并带数量断言。
+  6. **v0.6 修复"放大再缩小时卡标签烙印"**：凡是"放弃某个 major 标签"的
+     分支（超同屏上限 / 出界 / 重叠让位），旧代码一律直接 continue，跳过了
+     setLabel 与 hideLabel，DOM 上的 opacity 于是**冻结在最后一帧**。
+     放大再缩小时大量标签同时进出候选池，candidateBuf 被正在淡出的旧标签
+     占满，本该显示的标签全被挤到 continue 分支 → 屏幕上留下静止的烙印。
+     现在：新增 killLabel(item)，任何"放弃"路径都强制把 DOM 透明度写为 0；
+     跳过 setLabel 的分支改为先写一次当前透明度；正在淡出(targetV=0)的标签
+     不再占用 candidateBuf 名额，也不参与重叠避让。
+
+【可调参数索引】—— 每个参数的详细效果写在它上方的注释里
+  ERA_INTERVAL          各时代科技出场间隔 → 整体播放时长
+  RADII                 九层球壳半径 → 星云空间感
+  WA / DA               光点抖动幅度（小幅高频 / 大幅低频）
+  baseSize 系数         星球大小（另有 gl_PointSize 硬上限 22px）
+  MAX_SEG_DIST          同门类连线距离上限 → 连线疏密
+  TARGET                重大成就数量（450）
+  MAX_MAJOR_CANDIDATES  同屏常显标签上限（72，性能保险丝）
+  MAX_LABELS            新解锁标签的同时上限（30）
+  MIN_DIST_SQ           标签避让距离（24px）
+  TOL                   标签显示的时代范围（0=只显示相机聚焦的那个时代）
+  ZOOM_MIN / ZOOM_MAX   缩放上下限
+  PROG / PROG_GAIN      背景音乐的和弦进行与各声部音量
+  EXPAND_TIME/HOLD_TIME/RESET_TIME   终局爆炸（膨胀/停顿/收缩）节奏
+================================================================================
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>人类科技树 · 科技演化</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#010208;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased;user-select:none;touch-action:none}
+/* ── 全屏画布：three.js 的渲染目标，所有光点与连线都画在这里 ── */
+canvas{display:block;position:fixed;inset:0;width:100%;height:100%}
+#labels{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:5;transition:opacity .6s}
+.tech-label{position:absolute;left:0;top:0;white-space:nowrap;font-size:10px;font-weight:500;text-shadow:0 0 6px rgba(0,0,0,.9);padding:0 3px;border-radius:3px;opacity:0;transform:translate3d(-9999px,-9999px,0) translate(-50%,-50%);will-change:transform,opacity;pointer-events:none;backface-visibility:hidden}
+#hoverLabel{position:fixed;left:0;top:0;padding:5px 12px;font-size:13px;font-weight:600;white-space:nowrap;color:#eaf2ff;background:linear-gradient(135deg,rgba(14,26,52,.92),rgba(8,16,34,.92));border:1px solid rgba(120,180,255,.55);border-radius:8px;pointer-events:none;opacity:0;transform:translate3d(-9999px,-9999px,0) translate(-50%,-150%);text-shadow:0 0 8px rgba(120,180,255,.7);box-shadow:0 0 22px rgba(60,120,220,.45),inset 0 0 12px rgba(60,120,220,.15);transition:opacity .18s;z-index:50;will-change:transform,opacity;backface-visibility:hidden}
+#hoverLabel.show{opacity:1}
+/* ── 科技详情面板：点击光点后从底部滑出 ── */
+#techPanel{position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(24px) scale(.94);width:min(520px,calc(100vw - 32px));max-height:min(62vh,500px);overflow-y:auto;background:linear-gradient(160deg,rgba(12,22,44,.97),rgba(5,10,22,.97));border:1px solid rgba(120,180,255,.38);border-radius:16px;padding:20px 24px 22px;color:#d8e6ff;box-shadow:0 24px 70px rgba(0,0,0,.75),0 0 50px rgba(60,120,220,.22);opacity:0;pointer-events:none;z-index:60;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);transition:opacity .28s,transform .34s cubic-bezier(.2,.7,.3,1)}
+#techPanel::-webkit-scrollbar{width:6px}
+#techPanel::-webkit-scrollbar-thumb{background:rgba(120,180,255,.25);border-radius:3px}
+#techPanel.show{opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0) scale(1)}
+.panel-cat{display:inline-block;padding:3px 10px;font-size:10px;letter-spacing:.14em;border-radius:5px;margin-bottom:10px;font-weight:700}
+.panel-title{font-size:22px;font-weight:700;color:#fff;margin-bottom:8px;text-shadow:0 0 20px rgba(120,180,255,.35);padding-right:36px}
+.panel-meta{font-size:11px;color:#7fa4d8;letter-spacing:.1em;margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.panel-meta .dot-sep{width:3px;height:3px;border-radius:50%;background:rgba(120,180,255,.5);display:inline-block}
+.panel-meta .badge{padding:2px 7px;border-radius:3px;background:rgba(120,180,255,.15);color:#9fc3ff;font-weight:600;font-size:10px}
+.panel-meta .year-est{color:#5f7ba8;font-style:italic}
+.panel-desc{font-size:13px;line-height:1.9;color:#b8c8e4;border-top:1px solid rgba(120,180,255,.12);padding-top:14px}
+.panel-close,#infoPanel .info-close{position:absolute;top:14px;right:16px;width:28px;height:28px;border-radius:50%;border:1px solid rgba(120,180,255,.32);background:rgba(20,30,55,.7);color:#9fc3ff;font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .2s,transform .15s;padding:0}
+.panel-close:hover,#infoPanel .info-close:hover{background:rgba(40,70,130,.9);transform:rotate(90deg)}
+#hud{position:fixed;top:18px;left:20px;z-index:20;pointer-events:none}
+#hud .era-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+#hud .era{font-size:22px;font-weight:700;color:#eaf2ff;letter-spacing:.14em;text-shadow:0 0 22px rgba(110,170,255,.65)}
+#hud .year{font-size:13px;font-weight:500;color:#7fa4d8;font-variant-numeric:tabular-nums}
+#hud .count{font-size:11px;color:#7f93b5;margin-top:5px;line-height:1.6}
+#hud .count b{color:#9fc3ff}
+#legend{position:fixed;top:64px;right:20px;z-index:20;display:flex;flex-direction:column;gap:6px;pointer-events:none}
+#legend .item{display:flex;align-items:center;gap:7px;font-size:11px;color:#8fa4c4}
+#legend .dot{width:7px;height:7px;border-radius:50%;flex:none}
+#eraTitle{position:fixed;left:50%;bottom:104px;transform:translateX(-50%);text-align:center;z-index:25;pointer-events:none;opacity:0}
+#eraTitle .en{font-size:34px;font-weight:800;letter-spacing:.22em;color:#fff;text-indent:.22em;text-shadow:0 0 30px rgba(120,180,255,.9),0 0 70px rgba(80,130,255,.5)}
+#eraTitle .es{font-size:13px;font-weight:500;letter-spacing:.14em;color:#8fb2e0;margin-top:10px;text-indent:.14em;font-variant-numeric:tabular-nums}
+#eraTitle .ec{font-size:11px;font-weight:500;letter-spacing:.14em;color:#7fa4d8;margin-top:6px;text-indent:.14em;font-variant-numeric:tabular-nums}
+#eraTitle.show{animation:eraAnim 3.6s cubic-bezier(.2,.7,.3,1) forwards}
+@keyframes eraAnim{0%{opacity:0;transform:translateX(-50%) translateY(26px) scale(.88);filter:blur(8px)}
+14%{opacity:1;transform:translateX(-50%) translateY(0) scale(1);filter:blur(0)}
+72%{opacity:1;filter:blur(0)}
+100%{opacity:0;transform:translateX(-50%) translateY(-18px) scale(1.06);filter:blur(5px)}
+}
+/* ── 底部时间轴：播放键 · 倍速键 · 可拖动的进度条 ── */
+#timeline{position:fixed;left:0;right:0;bottom:0;z-index:30;padding:14px 22px calc(16px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:14px;background:linear-gradient(to top,rgba(1,2,8,.94),rgba(1,2,8,0))}
+#playBtn{width:34px;height:34px;flex:none;border-radius:50%;border:1px solid rgba(120,170,255,.35);background:rgba(20,30,55,.7);color:#9fc3ff;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:box-shadow .3s;backdrop-filter:blur(8px)}
+#playBtn.ready{border-color:rgba(160,210,255,.85);animation:pulseBtn 2.2s infinite}
+#speedBtn{flex:none;min-width:40px;height:26px;padding:0 8px;border-radius:7px;cursor:pointer;border:1px solid rgba(120,170,255,.3);background:rgba(20,30,55,.7);color:#9fc3ff;font-family:inherit;font-size:10px;font-weight:700;letter-spacing:.04em;font-variant-numeric:tabular-nums;backdrop-filter:blur(8px);transition:color .25s,border-color .25s,background .25s,box-shadow .3s;-webkit-tap-highlight-color:transparent}
+#speedBtn:hover{color:#dff0ff;border-color:rgba(160,210,255,.7);background:rgba(28,52,96,.9);box-shadow:0 0 14px rgba(90,160,255,.4)}
+@keyframes pulseBtn{0%,100%{box-shadow:0 0 18px rgba(120,180,255,.7),0 0 40px rgba(80,130,255,.4)}
+50%{box-shadow:0 0 26px rgba(140,200,255,1),0 0 55px rgba(100,150,255,.6)}
+}
+.track{position:relative;flex:1;height:26px;display:flex;align-items:center;cursor:pointer}
+.track::before{content:"";position:absolute;left:0;right:0;height:3px;border-radius:2px;background:rgba(110,150,220,.16)}
+.fill{position:absolute;left:0;height:3px;border-radius:2px;width:0;background:linear-gradient(90deg,#3b6fd4,#5ad1e8,#9b7bff,#c57bff,#ff6bd6);box-shadow:0 0 14px rgba(90,190,255,.75);pointer-events:none;will-change:width}
+.knob{position:absolute;left:0;width:13px;height:13px;border-radius:50%;background:#dff0ff;box-shadow:0 0 16px rgba(120,200,255,.95);transform:translateX(-50%);pointer-events:none;will-change:left}
+.ticks{position:absolute;inset:0;pointer-events:none}
+.tick{position:absolute;top:50%;width:1px;height:9px;margin-top:-4px;background:rgba(120,170,255,.35)}
+#timeTxt{flex:none;font-size:10px;color:#6f86a8;min-width:38px;text-align:right;font-variant-numeric:tabular-nums}
+#spinBtn{position:fixed;left:22px;bottom:88px;z-index:31;padding:9px 14px 9px 12px;display:flex;align-items:center;gap:9px;font-family:inherit;font-size:11px;font-weight:600;letter-spacing:.08em;color:#8fb2e0;background:rgba(14,24,46,.82);border:1px solid rgba(120,170,255,.28);border-radius:11px;cursor:pointer;backdrop-filter:blur(10px);transition:color .28s,border-color .28s,background .28s,box-shadow .3s;-webkit-tap-highlight-color:transparent}
+#spinBtn:hover{color:#c5ddff;border-color:rgba(140,190,255,.55);background:rgba(22,36,68,.9)}
+#spinBtn .led{width:9px;height:9px;flex:none;border-radius:50%;background:rgba(90,120,170,.55);box-shadow:inset 0 0 4px rgba(0,0,0,.6);transition:background .3s,box-shadow .4s}
+#spinBtn.active{color:#dff0ff;border-color:rgba(160,210,255,.75);background:rgba(28,52,96,.92);box-shadow:0 0 18px rgba(90,160,255,.4),inset 0 0 12px rgba(80,140,255,.15)}
+#spinBtn.active .led{background:#6fd0ff;box-shadow:0 0 10px #6fd0ff,0 0 20px rgba(110,200,255,.7)}
+/* ── 右上角圆形按钮组：音效开关（右）与返回主页面（其左侧 64px 处） ── */
+#soundBtn{position:fixed;top:18px;right:20px;z-index:40;width:34px;height:34px;border-radius:50%;border:1px solid rgba(120,170,255,.35);background:rgba(20,30,55,.72);color:#9fc3ff;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:color .28s,border-color .28s,background .28s,box-shadow .3s;-webkit-tap-highlight-color:transparent}
+#soundBtn:hover{color:#dff0ff;border-color:rgba(160,210,255,.75);background:rgba(28,52,96,.92)}
+#soundBtn.on{color:#dff0ff;border-color:rgba(160,210,255,.7);box-shadow:0 0 16px rgba(90,160,255,.45),inset 0 0 10px rgba(80,140,255,.18)}
+#soundBtn.off{color:#5b6f92;border-color:rgba(90,120,170,.22);background:rgba(10,18,34,.7);box-shadow:none}
+#soundBtn .ico{display:block;font-size:16px;line-height:1;transform:translateY(-1px)}
+#soundBtn::after{content:'';position:absolute;left:50%;top:50%;width:22px;height:1.5px;background:currentColor;border-radius:1px;opacity:.85;transform:translate(-50%,-50%) rotate(-45deg) scaleX(0);transition:transform .25s}
+#soundBtn.off::after{transform:translate(-50%,-50%) rotate(-45deg) scaleX(1)}
+@keyframes soundBoot{0%,100%{box-shadow:none}
+40%{box-shadow:0 0 24px rgba(110,200,255,.95),0 0 48px rgba(90,160,255,.6)}
+}
+#soundBtn.boot{animation:soundBoot 1.5s ease-out 1;color:#dff0ff;border-color:rgba(160,210,255,.9)}
+#homeBtn{position:fixed;top:18px;right:64px;z-index:40;width:34px;height:34px;border-radius:50%;border:1px solid rgba(120,170,255,.35);background:rgba(20,30,55,.72);color:#9fc3ff;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:color .28s,border-color .28s,background .28s,box-shadow .3s;-webkit-tap-highlight-color:transparent}
+#homeBtn:hover{color:#dff0ff;border-color:rgba(160,210,255,.75);background:rgba(28,52,96,.92);box-shadow:0 0 16px rgba(90,160,255,.45)}
+#homeBtn svg{width:17px;height:17px;display:block}
+#footerBox{position:fixed;right:22px;bottom:88px;z-index:31;display:flex;align-items:flex-end;gap:10px;pointer-events:none}
+#footerLines{display:flex;flex-direction:column;align-items:flex-end;gap:2px;font-size:10px;line-height:1.5;color:#5f7ba8;letter-spacing:.07em;text-shadow:0 0 8px rgba(0,0,0,.85);pointer-events:none;font-variant-numeric:tabular-nums}
+#footerLines .by{color:#7fa4d8;font-weight:600;letter-spacing:.09em}
+#infoBtn{pointer-events:auto;width:24px;height:24px;flex:none;border-radius:50%;border:1px solid rgba(120,170,255,.35);background:rgba(20,30,55,.72);color:#9fc3ff;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;line-height:1;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:color .25s,border-color .25s,background .25s,box-shadow .3s,transform .18s;-webkit-tap-highlight-color:transparent}
+#infoBtn:hover{color:#dff0ff;border-color:rgba(160,210,255,.75);background:rgba(28,52,96,.92);box-shadow:0 0 16px rgba(90,160,255,.5);transform:translateY(-1px)}
+#infoBtn:active{transform:scale(.92)}
+#infoPanel{position:fixed;left:50%;top:50%;z-index:70;width:min(420px,calc(100vw - 48px));transform:translate(-50%,-50%) scale(.92);background:linear-gradient(160deg,rgba(12,22,44,.97),rgba(5,10,22,.97));border:1px solid rgba(120,180,255,.4);border-radius:16px;padding:36px 30px 32px;color:#d8e6ff;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,.8),0 0 60px rgba(60,120,220,.28);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);opacity:0;pointer-events:none;transition:opacity .28s,transform .34s cubic-bezier(.2,.7,.3,1)}
+#infoPanel.show{opacity:1;pointer-events:auto;transform:translate(-50%,-50%) scale(1)}
+#infoPanel .info-icon{font-size:26px;margin-bottom:14px;color:#8fb2e0;line-height:1;text-shadow:0 0 22px rgba(120,180,255,.85)}
+#infoPanel .info-main{font-size:15px;line-height:1.95;color:#cfe0ff;font-weight:600;text-shadow:0 0 14px rgba(120,180,255,.35)}
+#infoPanel .info-sub{margin-top:14px;font-size:12px;letter-spacing:.08em;color:#7fa4d8}
+/* ── 移动端适配：缩小字号与控件尺寸、详情面板改为贴底通栏 ── */
+@media (max-width:640px){#hud .era{font-size:16px}
+#hud .year{font-size:11px}
+#legend{display:none}
+#eraTitle .en{font-size:22px;letter-spacing:.16em;text-indent:.16em}
+#eraTitle .es{font-size:11px;letter-spacing:.1em;text-indent:.1em;margin-top:7px}
+#eraTitle .ec{font-size:10px;letter-spacing:.1em;text-indent:.1em;margin-top:5px}
+.tech-label{font-size:9px}
+#hoverLabel{font-size:11px;padding:4px 9px}
+#techPanel{left:16px;right:16px;bottom:88px;width:auto;padding:16px 18px;transform:translateX(0) translateY(24px) scale(.94)}
+#techPanel.show{transform:translateX(0) translateY(0) scale(1)}
+.panel-title{font-size:18px}
+#timeline{padding:10px 14px calc(12px + env(safe-area-inset-bottom))}
+#spinBtn{bottom:82px;left:14px;font-size:10px;padding:8px 11px 8px 10px}
+#soundBtn{top:14px;right:14px;width:30px;height:30px}
+#soundBtn .ico{font-size:14px}
+#homeBtn{top:14px;right:52px;width:30px;height:30px}
+#homeBtn svg{width:15px;height:15px}
+#soundBtn::after{width:19px}
+#footerBox{right:14px;bottom:82px;gap:8px}
+#footerLines{font-size:9px;letter-spacing:.05em}
+#infoBtn{width:22px;height:22px;font-size:11px}
+#infoPanel{padding:30px 22px 26px}
+#infoPanel .info-main{font-size:14px}
+#infoPanel .info-sub{font-size:11px}
+}
+:root{--home-fg:#eaf2ff;--home-dim:#9ab4d8;--home-mute:#6f8fc4;--home-line:rgba(120,180,255,.32);--home-line-hi:rgba(160,210,255,.75);--home-ease:cubic-bezier(.2,.7,.3,1);}
+/* ── 主页面：深空径向渐变 + 呼吸光晕 + 玻璃拟态按钮。
+      z-index 200 高于所有场景 UI，主页期间由 body.home-active 隐藏它们 ── */
+#homePage{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px 24px 64px;color:var(--home-fg);background:radial-gradient(ellipse 90% 70% at 50% 36%,rgba(16,30,60,.88) 0%,rgba(5,10,22,.95) 52%,rgba(1,2,8,.985) 100%);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);transition:opacity .62s var(--home-ease),transform .62s var(--home-ease),filter .62s var(--home-ease);}
+#homePage.leaving{opacity:0;transform:scale(1.05);filter:blur(12px);pointer-events:none}
+.home-glow{position:absolute;left:50%;top:34%;width:min(760px,120vw);height:min(760px,120vw);transform:translate(-50%,-50%);pointer-events:none;background:radial-gradient(circle,rgba(90,150,255,.18) 0%,rgba(120,90,255,.08) 38%,transparent 68%);animation:homeBreathe 9s ease-in-out infinite;}
+@keyframes homeBreathe{0%,100%{opacity:.75;transform:translate(-50%,-50%) scale(1)}
+50%{opacity:1;transform:translate(-50%,-50%) scale(1.08)}
+}
+.home-inner{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;max-width:660px}
+.home-kicker{font-size:11px;font-weight:600;letter-spacing:.42em;text-indent:.42em;color:var(--home-mute);margin-bottom:20px}
+.home-title{font-size:clamp(38px,7vw,64px);font-weight:800;letter-spacing:.16em;text-indent:.16em;background:linear-gradient(180deg,#fff 0%,#bcd7ff 62%,#7ea8e8 100%);-webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 0 34px rgba(110,170,255,.55))}
+.home-sub{margin-top:20px;font-size:clamp(12px,1.6vw,14px);line-height:2;color:var(--home-dim);letter-spacing:.06em}
+.home-stats{display:flex;gap:34px;margin-top:40px;flex-wrap:wrap;justify-content:center}
+.home-stats .stat{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:66px}
+.home-stats .stat b{font-size:26px;font-weight:700;color:#dff0ff;font-variant-numeric:tabular-nums;text-shadow:0 0 20px rgba(120,180,255,.6)}
+.home-stats .stat span{font-size:10px;letter-spacing:.2em;text-indent:.2em;color:var(--home-mute)}
+#enterBtn{margin-top:46px;display:flex;align-items:center;gap:10px;padding:13px 34px;font-family:inherit;font-size:13px;font-weight:700;letter-spacing:.16em;text-indent:.16em;color:#eaf6ff;cursor:pointer;border-radius:999px;border:1px solid rgba(150,200,255,.55);background:linear-gradient(135deg,rgba(38,74,140,.9),rgba(20,40,84,.9));box-shadow:0 0 26px rgba(80,150,255,.35),inset 0 0 18px rgba(90,160,255,.14);transition:transform .18s var(--home-ease),box-shadow .3s,border-color .3s;-webkit-tap-highlight-color:transparent}
+#enterBtn:hover{border-color:rgba(190,225,255,.9);box-shadow:0 0 40px rgba(110,180,255,.6),inset 0 0 22px rgba(110,180,255,.22)}
+#enterBtn:active{transform:scale(.96)}
+#enterBtn .ico{font-size:10px;transform:translateY(-1px)}
+.home-cats{margin-top:42px;display:flex;gap:7px;flex-wrap:wrap;justify-content:center;max-width:768px}
+.home-cats .cat{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;font-size:10.5px;letter-spacing:.05em;color:#9fb8d8;border-radius:999px;border:1px solid rgba(120,170,255,.18);background:rgba(14,24,46,.5)}
+.home-cats .cat i{width:6px;height:6px;border-radius:50%;flex:none}
+.home-footer{position:absolute;left:0;right:0;bottom:calc(22px + env(safe-area-inset-bottom));display:flex;align-items:center;justify-content:center;gap:10px;font-size:10px;letter-spacing:.14em;color:#4d6484}
+.home-footer .by{color:#7fa4d8;font-weight:600}
+.home-footer .sep{width:3px;height:3px;border-radius:50%;background:rgba(120,180,255,.4)}
+body.home-active #hud,body.home-active #legend,body.home-active #timeline,body.home-active #spinBtn,body.home-active #footerBox,body.home-active #soundBtn,body.home-active #homeBtn,body.home-active #labels,body.home-active #eraTitle,body.home-active #techPanel,body.home-active #hoverLabel{opacity:0 !important;pointer-events:none !important}
+#hud,#legend,#timeline,#spinBtn,#footerBox,#soundBtn{transition:opacity .5s ease}
+@media (max-width:640px){.home-kicker{font-size:9px;letter-spacing:.3em;text-indent:.3em}
+.home-title{letter-spacing:.1em;text-indent:.1em}
+.home-stats{gap:22px;margin-top:30px}
+.home-stats .stat b{font-size:20px}
+.home-stats .stat span{font-size:9px}
+#enterBtn{margin-top:34px;padding:12px 28px;font-size:12px}
+.home-cats{gap:6px;margin-top:30px}
+.home-cats .cat{font-size:9.5px;padding:4px 9px}
+.home-sub{line-height:1.9}
+}
+#loadWarn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:300;display:none;padding:16px 24px;border-radius:12px;max-width:min(420px,86vw);text-align:center;font-size:13px;line-height:2;color:#ffd9a0;background:rgba(40,26,10,.94);border:1px solid rgba(255,180,90,.45);box-shadow:0 20px 60px rgba(0,0,0,.7)}
+</style>
+</head>
+<body class="home-active">
+<div id="loadWarn">三维渲染需要联网加载 three.js。<br>当前无法访问网络，星空与科技树将无法显示。</div>
+<div id="homePage">
+  <div class="home-glow"></div>
+  <div class="home-inner">
+    <div class="home-kicker">HUMAN TECHNOLOGY TREE</div>
+    <h1 class="home-title">人类科技树</h1>
+    <p class="home-sub">从史前时期跨越至未来时代的<br>人类文明发展史</p>
+    <div class="home-stats" id="homeStats"></div>
+    <button id="enterBtn" type="button"><span class="ico">▶</span><span>开始探索</span></button>
+    <div class="home-cats" id="homeCats"></div>
+  </div>
+  <div class="home-footer">
+    <span class="by">By.LiangHe</span>
+    <span class="sep"></span>
+    <span>v0.6 · Beta</span>
+  </div>
+</div>
+<canvas id="scene"></canvas>
+<div id="labels"></div>
+<div id="hoverLabel"></div>
+<div id="techPanel">
+  <button class="panel-close" id="panelClose">✕</button>
+  <div class="panel-cat" id="panelCat"></div>
+  <div class="panel-title" id="panelTitle"></div>
+  <div class="panel-meta" id="panelMeta"></div>
+  <div class="panel-desc" id="panelDesc"></div>
+</div>
+<div id="hud">
+  <div class="era-row"><span class="era" id="hudEra">史前时代</span><span class="year" id="hudYear">公元前300万年</span></div>
+  <div class="count" id="hudCount"></div>
+</div>
+<div id="legend"></div>
+<div id="eraTitle"></div>
+<button id="homeBtn" aria-label="返回主页面" title="返回主页面"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V20h13V9.5"/></svg></button>
+<button id="soundBtn" class="on" aria-pressed="true" aria-label="音效开关" title="音效开关"><span class="ico">♪</span></button>
+<button id="spinBtn" aria-pressed="false"><span class="led"></span><span>轨道旋转</span></button>
+<div id="footerBox">
+  <div id="footerLines">
+    <div class="by">By.LiangHe</div>
+    <div>v0.6 · Beta</div>
+  </div>
+  <button id="infoBtn" aria-label="提示信息" title="提示信息">!</button>
+</div>
+<div id="infoPanel" role="dialog" aria-modal="true">
+  <button class="info-close" id="infoClose" aria-label="关闭">✕</button>
+  <div class="info-icon">!</div>
+  <div class="info-main">拖动旋转视角 · 滚轮缩放<br>点击光点查看科技详情<br>底部时间轴可拖动定位时代</div>
+  <div class="info-sub">左下角可开启「轨道旋转」</div>
+</div>
+<div id="timeline">
+  <button id="playBtn">❚❚</button>
+  <button id="speedBtn" title="播放倍速">1×</button>
+  <div class="track" id="track"><div class="ticks" id="ticks"></div><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>
+  <div id="timeTxt">0%</div>
+</div>
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script><script type="module">
+import * as THREE from 'three';
+THREE.ColorManagement.enabled = false;
+window.__dshReady = true;
+/* ============================================================
+   【光点抖动参数】每个科技光点在原位附近轻微游动，显得"活着"
+   WA：小幅高频抖动 —— 调大=更活跃、更毛躁；调小=更沉静
+   DA：大幅低频漂移 —— 调大=更松散飘逸，过大会失去球形轮廓
+   建议：WA 0.01~0.06   DA 0.05~0.25
+   ============================================================ */
+const WA = 0.030, DA = 0.120;
+/* 【轨道旋转】开启后每个光点绕自己的随机轴自转的整体速度倍率
+   调大=转得更快更晕眩；调小=更缓慢庄严；设为 0 等于关闭自转
+   TRAIL_DELAY 是拖尾落后主体的时间（秒），调大=拖影拉得更长 */
+const SPIN_SCALE = 0.30;
+const TRAIL_DELAY = 0.22;
+const _off = { x:0, y:0, z:0 };
+function physOffset(n, t){
+  const f = n.freq, p = n.phase;
+  _off.x = Math.sin(t*f + p) * WA + Math.sin(t*f*0.17 + p*1.30) * DA;
+  _off.y = Math.sin(t*f*1.13 + p + 1.70) * WA + Math.sin(t*f*0.13 + p*0.90 + 2.10) * DA;
+  _off.z = Math.sin(t*f*0.87 + p + 3.40) * WA + Math.sin(t*f*0.19 + p*1.10 + 4.30) * DA;
+  return _off;
+}
+/* ============================================================
+   【科技门类】共 7 类，key 用于数据索引，color 决定光点与标签配色
+   增删门类时必须同时修改：V 词库、ERA_DEFS 中每个时代的 g 字段、
+   以及 DESC_STEM 中对应的句干组，否则该门类不会有内容
+   ============================================================ */
+const CATS = [
+  { key:'power',     name:'能源动力', color:'#FF8A3D' },
+  { key:'material',  name:'材料制造', color:'#FFD666' },
+  { key:'info',      name:'信息计算', color:'#33D6C8' },
+  { key:'bio',       name:'生命医学', color:'#6FE06F' },
+  { key:'transport', name:'交通航天', color:'#4E9BFF' },
+  { key:'society',   name:'社会文明', color:'#C08CFF' },
+  { key:'military',  name:'军事武器', color:'#FF5C7A' },
+];
+const CAT_COLOR = {};
+CATS.forEach(c => CAT_COLOR[c.key] = new THREE.Color(c.color));
+/* 【未来科技名生成器】用"前缀+中缀+后缀"三个词库随机组合出新科技名，
+   避免为未来时代手写上千个名字。count 控制每类生成多少个 */
+function genSci(P, B, S, count, offset = 0){
+  const out = [], used = new Set();
+  const pN = P.length, bN = B.length, sN = S.length;
+  for(let i = 0; i < pN * bN * sN && out.length < count; i++){
+    const name = P[(i + offset) % pN] + B[(i*3 + offset*2) % bN] + S[(i*5 + offset) % sN];
+    if(used.has(name)) continue;
+    used.add(name); out.push(name);
+  }
+  return out;
+}
+/* 【词库】powerP/matP/... 是各门类的前缀、中缀、后缀词汇表
+   改这些词会直接改变"未来时代"生成出来的科技名风格 */
+const V = {
+  powerP:['恒星级','星系级','宇宙级','量子级','超维','零点','真空','暗物质','暗能量','奇点','时空','维度','反物质','引力','曲率','超弦','膜','全息','拓扑','分形','混沌','熵','负熵','玻色','费米','马约拉纳','任意子','磁单极','夸克','胶子','希格斯','中微子','引力子','光子','声子','等离激元','极化子','激子','孤子','戴森','卡尔达肖夫'],
+  powerB:['聚变','裂变','湮灭','衰变','隧穿','涨落','共振','振荡','脉冲','约束','聚焦','转化','辐射','对流','扩散','压缩','膨胀','冷却','激发','衰变'],
+  powerS:['反应堆','发电机','引擎','核心','矩阵','熔炉','工厂','采集器','转化器','提取器','储存器','传输器','放大器','稳定器','控制器','动力源','发生器','推进器','场','塔'],
+  matP:['可编程','智能','自适应','自修复','自组装','分子','原子','量子','拓扑','分形','超晶格','单晶','多晶','非晶','准晶','液晶','光晶','声晶','磁晶','电晶','超导','超流','超固','简并','纠缠','相干','压缩','真空','奇异','暗','二向','负折射','负质量','光子','声子','等离激元','激子','极化子','孤子','强关联'],
+  matB:['金属','陶瓷','聚合物','复合材料','合金','纳米管','石墨烯','碳纤维','气凝胶','泡沫','薄膜','涂层','晶体','玻璃','塑料','纤维','晶格','骨架','结构','网络'],
+  matS:['材料','物质','基体','纳米结构','超结构','构架','网络','阵列','薄膜','涂层','复合材料','晶格','纤维','泡沫','凝胶'],
+  infoP:['量子','神经','光','生物','DNA','分子','原子','自旋','拓扑','超导','光子','声子','等离激元','激子','全息','维度','多元','时间','因果','概率','模因','认知','情感','集体','群体','超级','通用','人工','机器','合成','分布式','并行','边缘','云','雾','海','银河','星际','宇宙','超维','多维'],
+  infoB:['计算','智能','算法','网络','通信','存储','处理','学习','推理','认知','意识','记忆','感知','决策','规划','控制','交互','接口','协议','系统'],
+  infoS:['引擎','系统','网络','矩阵','核心','架构','平台','框架','协议','芯片','处理器','终端','节点','数据库','操作系统','模型','算法','学习器','感知器','决策器'],
+  bioP:['纳米','基因','细胞','组织','器官','系统','神经','脑','意识','记忆','免疫','代谢','内分泌','循环','呼吸','消化','骨骼','肌肉','皮肤','血液','淋巴','干细胞','胚胎','克隆','合成','人工','生物','仿生','机械','电子','量子','分子','原子','光','声','磁','电','化学','生态','微生物'],
+  bioB:['工程','医学','修复','再生','增强','改造','编辑','调控','诱导','抑制','激活','沉默','转录','翻译','复制','分裂','分化','凋亡','自噬','代谢'],
+  bioS:['技术','疗法','药物','疫苗','器械','设备','装置','系统','工程','程序','方案','试剂','因子','蛋白','基因','细胞','组织','器官','模拟器','机器人'],
+  trP:['曲速','虫洞','超空间','跃迁','时空','维度','量子','引力','反重力','反物质','聚变','核','等离子体','离子','光子','激光','微波','磁','电','太阳帆','光帆','磁帆','电帆','曲率','亚空间','超光速','星际','银河','宇宙','深空','行星','恒星','星云','黑洞','白洞','奇点','超弦','膜','全息','跨维'],
+  trB:['引擎','推进','驱动','航行','飞行','传送','跳跃','穿梭','旅行','运输','轨道','航线','穿越','滑翔','跃迁','折跃'],
+  trS:['引擎','飞船','星舰','探测器','飞行器','运载器','穿梭机','传送门','通道','航线','港口','基地','站','城市','殖民地','母舰','方舟'],
+  socP:['星际','银河','宇宙','跨维','多元','后稀缺','后劳动','后人类','超人','赛博','数字','虚拟','量子','智能','AI','机器','合成','集体','群体','蜂群','分布式','去中心化','自治','共识','流动性','算法','预测','通用','基本','共享','礼物','资源','后资本','后社会','戴森','卡尔达肖夫','II型','III型','IV型'],
+  socB:['文明','社会','联邦','帝国','联盟','共和','民主','治理','经济','贸易','金融','货币','法律','伦理','道德','教育','医疗','福利','文化','艺术'],
+  socS:['文明','社会','联邦','帝国','联盟','共和国','体系','制度','模型','框架','协议','平台','网络','生态','乌托邦','共同体','城邦','星系'],
+  milP:['引力','黑洞','反物质','维度','时间','因果','概率','量子','纳米','灰蛊','自我复制','冯诺依曼','智能','自主','蜂群','星舰','行星','恒星','星系','宇宙','现实','时空','超光速','曲速','量子纠缠','意识','基因','合成生物','AI','赛博','网络','信息','模因','认知','心理','社会','经济','引力子'],
+  milB:['武器','炸弹','导弹','鱼雷','炮','枪','激光','射线','光束','脉冲','场','护盾','装甲','防御','攻击','打击','干扰','欺骗','封锁','摧毁'],
+  milS:['武器','系统','装置','平台','阵列','网络','盾','场','弹','炮','器','机','矩阵','核心','炮台','导弹','发射器','发生器'],
+};
+const s = str => str.split('|');
+/* ============================================================
+   【九大时代数据】每个时代包含中英文名、起止年份(y0/y1)和七门类科技名
+   · y0/y1 决定该时代在时间轴上的跨度与"公元前XX年"的显示
+   · g 里每行是 "名字|名字|名字" 形式，用 s() 拆成数组
+   · 名字的顺序会影响它在该时代内的出现先后（除非在 KNOWN_YEARS 里有年份）
+   增删科技条目后，科技总数与"重大成就"配额会自动重算，无需手改
+   ============================================================ */
+const ERA_DEFS = [
+{ name:'史前时代', en:'PREHISTORIC', y0:-3000000, y1:-10000, g:{
+  power: s('火的使用|天然火种保存|钻木取火|燧石打火|木炭烧制|火把照明|动物油脂灯|火塘|篝火信号|干柴储备|火烤食物|烟熏保存|树脂火把|干燥苔藓引火|黄铁矿取火|弓钻取火|火种保存容器|篝火坑构筑|烟熏驱虫|火烤兽皮|灰烬肥料|烧荒农业|陶窑烧制|木炭封闭窑|土坑窑|烟道通风|地炉取暖|石灶构筑|风箱雏形|燃油灯盏|松脂照明|干草捆燃料'),
+  material: s('打制石器|砍砸器|刮削器|尖状器|石核|石叶|骨器|鹿角镐|木矛|兽皮缝制|植物纤维绳索|石斧|石镰|磨制石器|陶器烧制|编织篮筐|赭石颜料|鱼钩鱼叉|投矛器|弓与箭|石臼|研磨器|皮革鞣制|木碗|树皮容器|尖木桩|石钻|石锥|石刀片|细石器|复合工具|石矛头|穿孔石珠|贝壳装饰|骨制鱼钩|骨制针|骨制锥|骨笛雕刻|兽骨工具|象牙雕刻|木制盾牌|编织草席|编织渔网|绳索打结|植物染料|矿物颜料|天然胶粘剂|沥青粘合|生漆使用|竹器编制|藤条捆扎|树皮布|简易帐篷|皮囊容器|木桶雏形|独轮拖车|石制磨盘|兽皮袋|木铲|骨铲|石凿|木楔|骨楔|简易滑轮|绳索提升'),
+  info: s('结绳记事|洞穴壁画|计数刻痕|原始语言|口述传承|手势符号|骨笛|季节观察|月亮周期记录|岩刻地图|仪式舞蹈|音律|方位记忆|迁徙路线|手势计数|刻木记事|贝壳计数|小石子计数|身体部位计数|月相记录|昼夜观测|星座识别|方向辨别|季节划分|原始歌谣|口传史诗|故事讲述|符号刻划|图案标记|图腾符号|仪式记号|足迹追踪|天气征兆观察|植物周期观察|动物迁徙记录|地理路线记忆|部落方言|哨语交流|鼓声传讯|烟雾信号|火光信号|实物信件|标记路标'),
+  bio: s('草药认知|骨折夹板|放血疗法|钻颅术|犬的驯化|伤口烧灼止血|助产经验|毒物辨识|植物驯化|驱虫|咀嚼草药|冷敷|骨针缝合|伤口清洗|伤口包扎|草药敷贴|接骨按摩|止血草药|退热草药|解毒草药|驱虫草药|药膏制作|药汤煎煮|蒸汽浴|冷热敷交替|按摩疗法|放血疗法改良|助产技术|婴儿护理|断骨固定|烧伤处理|蛇咬处理|骨折复位|驱虫治疗|食疗|动物药|昆虫入药|药草采集|药草晾晒|药草储存|外伤草药|内服草药|外敷药泥'),
+  transport: s('独木舟|木筏|雪橇|皮筏|徒步迁徙|驮运|藤桥|渡河|冰面行走|涉水渡河|结冰渡河|简易木桥|独木浮桥|背篓运输|头顶搬运|拖拽运输|滚木搬运|圆木滚轴|简易担架|皮划艇|竹筏|树枝雪鞋|滑板拖曳|树皮船|充气皮囊|漂浮木排|陆路标记'),
+  society: s('部落氏族|图腾崇拜|葬礼仪式|以物易物|长老议事|集体狩猎|火塘社会|禁忌规则|部落联盟|成年礼|分配制度|巫术|祭祀|共享食物|族外婚|对偶婚|母系氏族|父系氏族|年龄分组|性别分工|采集分工|狩猎分工|食物储存|食物分配|火塘会议|冲突调解|部落间通婚|贸易路线|互惠赠礼|成人仪式|命名仪式|丧葬习俗|祖先崇拜|自然崇拜|巫师阶层|口述律法|禁猎区|领地标记|部落誓言|血亲复仇|礼物交换|结拜仪式'),
+  military: s('石球|投石索|木质盾牌|防御栅栏|陷阱猎具|标枪|石锤|围猎战术|火攻|毒箭|燧石匕首|骨制匕首|木棒加石|投石器改良|皮盾|木盾|火把战|烟熏战术|陷阱围猎|投掷矛|短矛|长矛|石斧改良|弹弓|毒箭制作|兽骨箭头|复合弓雏形|火攻战术|诱敌陷阱|围困战术|夜间突袭|部落战斗队形|战吼威慑')
+}},
+{ name:'农业文明', en:'AGRICULTURE', y0:-10000, y1:-800, g:{
+  power: s('灌溉渠|桔槔|水车|畜力犁|风帆|水磨坊|畜力挽具|梯田灌溉|水井|提水轮|风箱|牛拉水车|水力鼓风|沼气池雏形|水渠闸门|引水渠|蓄水池|水窖|龙骨水车|筒车|翻车|辘轳|滑轮提水|杠杆提水|水碓|水砻|水力纺车|水力鼓风机|畜力磨|牛拉碾|水力锯|水力锤|潮汐水车|风力提水|地窖储粮|谷仓通风|火炕取暖'),
+  material: s('陶轮|铜冶炼|青铜合金|青铜铸造|砖窑|石灰砂浆|玻璃珠|纺织机|染色工艺|铁矿冶炼|铸铁|金箔|玉器雕刻|彩陶|芦苇纸|鞣革|沥青防水|纺锤|织布机|琉璃|珐琅|马赛克雏形|青铜犁|青铜镰刀|青铜凿|青铜钻|青铜锯|青铜锛|失蜡法铸造|陶范铸造|铜焊|锻打工艺|淬火萌芽|退火工艺|合金配比|丝绸纺织|蚕桑养殖|缫丝|麻布纺织|毛纺|毛毡|印染|媒染剂|蓝靛染料|茜草染料|石膏烧制|石灰烧制|青砖烧制|琉璃瓦|铅玻璃|吹制玻璃|平板玻璃|水泥雏形|水硬石灰|砂浆砌筑'),
+  info: s('楔形文字|圣书体|甲骨文|泥板文书|算筹|算盘|十进制计数|六十进制|太阳历|太阴历|日晷|水钟|莎草纸|天文观测|字母文字|图书馆|星象记录|地图绘制|印章|数字零的萌芽|度量单位|算表|历法修订|象形文字|腓尼基字母|希腊字母|拉丁字母|印章文字|竹简|木牍|帛书|蜡板|蜡书|羊皮纸雏形|泥版契约|算筹记数|算板|算珠|十进位值|分数概念|负数萌芽|无理数萌芽|勾股数|平方表|立方表|天文历法|闰月|冬至夏至测定|日食记录|彗星记录|星座划分|黄道十二宫|天球坐标|浑天说|盖天说|日影测时|漏刻计时|圭表|土圭|罗盘雏形|风向标|雨量筒'),
+  bio: s('小麦栽培|水稻栽培|玉米驯化|牛的驯化|羊的驯化|猪的驯化|马的驯化|鸡的驯化|酿酒|发酵面包|奶酪制作|草药方剂|创伤包扎|接骨术|灌肠疗法|麻醉草药|驱虫草药|药酒|针灸雏形|拔罐|大麦栽培|燕麦栽培|豆类栽培|甘蔗栽培|茶树栽培|葡萄栽培|橄榄栽培|椰枣栽培|棉花栽培|亚麻栽培|芦苇栽培|骡的驯化|鸭的驯化|鹅的驯化|鸽的驯化|蜜蜂饲养|蚕的驯化|发酵酱油|发酵醋|发酵酱|泡菜腌制|咸鱼腌制|腊肉制作|蜂蜜储存|草药配伍|君臣佐使|望闻问切|脉诊|舌诊|方剂学|针灸|艾灸|拔火罐|刮痧|推拿|正骨|本草记录|药性分类|炮制工艺'),
+  transport: s('轮子|马车|战车|帆船|桨帆船|骆驼商队|驿道|运河|木桥|浮桥|马鞍|船桨改良|纤夫拉船|辐条车轮|车轴|车辕|车厢|牛车|驴车|双轮战车|四轮马车|马镫雏形|马蹄铁雏形|驿站|驿马|邮驿系统|运河闸门|石拱桥|悬索桥雏形|船帆改良|三角帆|船尾舵|船锚|灯塔雏形|码头|船坞|人工港|海岸航线|季风航线|星象导航|指南针|水密隔舱'),
+  society: s('城市聚落|城邦|法典|货币|税收|神庙|祭司阶层|文字官僚|金字塔|市场|度量衡|契约|邮政|奴隶制|灌溉管理|常备军|户籍|节日|学校|城墙|城郭|王宫|市政广场|市集|铸币|纸币雏形|银锭|铜钱|税收制度|徭役|征兵制|官僚制|文书制度|户籍登记|土地登记|刑法|民法|审判制度|诉讼程序|监狱|外交使节|条约|盟约|王室婚姻|继承制|封地|采邑|朝贡体制|宗教祭祀|神殿建筑|历法节日|书院|档案馆|史官制度'),
+  military: s('青铜剑|矛阵|盾牌|盔甲|城墙|攻城锤|投石机|弩|战车冲锋|烽火台|云梯|要塞|边防长城|铁兵器|青铜戈|青铜戟|青铜钺|青铜头盔|青铜护胸|皮甲|藤甲|木盾|铁盾|投石索|标枪|弓箭改良|复合弓|强弩|连弩|弩机|箭镞|毒箭|关隘|护城河|吊桥|闸门|铁蒺藜|拒马|障碍栅栏|攻城塔|撞城车|地道战术|水攻|火攻|烟幕|战鼓|军旗|号角')
+}},
+{ name:'古典时代', en:'CLASSICAL', y0:-800, y1:500, g:{
+  power: s('罗马水车|螺旋提水器|水轮磨|水锤锻|矿井排水|日晒制盐|沥青燃料|水力锯木|反作用式蒸汽球|风帆优化|水车列|水库|渡槽供水|链式提水|斗式提水|水车组|水磨坊|水轮锯|水轮钻|水轮锤|水轮鼓风|水力纺织|潮汐磨坊|风力磨坊|煤球燃料|石炭开采|矿井通风|矿灯|矿井排水机械|阿基米德螺旋泵|克特西比乌斯泵|压力泵|虹吸管|渡槽|水闸|船闸|活塞泵|消防泵|攻城泵'),
+  material: s('高炉|生铁冶炼|坩埚钢|罗马混凝土|吹制玻璃|马赛克|拱券结构|铅管|防水灰泥|石灰窑|淬火工艺|失蜡铸造|水银提炼|颜料制造|混凝土穹顶|大理石切割|钢铁渗碳|起重机|熟铁|锻铁|花纹钢|大马士革钢|坩埚炼钢|生铁脱碳|渗碳工艺|淬火回火|折叠锻打|锡焊|铜焊|银焊|金箔锤打|鎏金工艺|失蜡法|陶范法|砂型铸造|青铜雕塑|大理石雕像|马赛克拼贴|壁画颜料|朱砂颜料|铅白颜料|靛蓝颜料|泰尔紫染料|明矾媒染|玻璃吹制|玻璃雕刻|玻璃窗|透镜雏形|水晶打磨|宝石雕刻|火山灰水泥|罗马砂浆|浮石混凝土|石拱桥|石柱|穹顶|飞扶壁雏形'),
+  info: s('欧几里得几何|阿基米德浮力|地心说模型|安提基特拉机械|星盘|羊皮纸|图书馆分类法|罗马数字|零的概念|算经|经纬度概念|勾股定理|圆周率计算|杠杆原理|齿轮传动|螺旋机构|光学反射|地圆说|滑轮组|凸轮机构|棘轮|水力钟|星表|公理体系|演绎推理|几何原本|圆锥曲线|球面几何|数论|素数研究|完全数|黄金分割|无理数|浮力定律|杠杆定律|滑轮组原理|螺旋原理|重心计算|抛物线|光学折射|平面镜成像|凹面镜|凸透镜雏形|日心说萌芽|地动说|天体运行模型|行星运动|月食预测|日食预测|子午线测量|地球周长估算|地图投影|经纬网|气候带划分|潮汐原理|声学共鸣|音程计算|机械钟雏形|水力风琴|自动机|攻城机械|蜗杆传动|曲柄机构|活塞机构'),
+  bio: s('解剖学|希波克拉底医学|盖伦医学|外科手术器械|缝合|曼陀罗麻醉|公共卫生下水道|引水渠|检疫|助产术|眼科手术|脉搏诊断|草药学|针灸|脉诊|药典|放血|骨折复位|绷带|医院雏形|四体液说|人体解剖|骨骼研究|肌肉研究|神经研究|血管研究|动脉结扎|止血钳|手术刀|探针|导管|导尿管|产钳雏形|胎位矫正|剖腹产雏形|白内障手术|扁桃体切除|疝气手术|截肢术|骨科器械|绷带包扎|石膏固定|牵引复位|烧灼止血|缝合线|丝线缝合|肠线缝合|麻醉药|曼陀罗酒|鸦片酊|催眠术|水疗|饮食疗法|运动疗法|按摩疗法|药膏|膏药|药丸|汤剂|散剂|药酒|急救术|军医制度|浴场卫生|传染病隔离'),
+  transport: s('阿基米德螺旋泵|罗马大道|渡槽|多层桨帆船|灯塔|季风航海|船舵|司南|罗马驿站|双轮战车|浮桥|运河船闸|码头|船坞|罗马公路网|里程碑|驿道|石铺路|拱桥|渡槽桥|隧道|盘山道|帆船|三角帆|纵帆|横帆|多桅帆船|桨帆并用|撞角战舰|商船|粮船|运输船|港口|防波堤|干船坞|港口仓储|指南车|计里鼓车|悬挂马车|轿子|驿站系统|邮政驿站|信鸽传书|烽火通信'),
+  society: s('共和制|元老院|公民大会|罗马法|行省管理|税制改革|常备军团|邮政系统|儒学|佛学|史学编纂|科举萌芽|货币统一|丝绸之路|度量衡统一|户籍制度|哲学学派|公共浴场|剧场|竞技场|民主制|寡头制|君主制|帝国制|议会|陪审团|选举制|任期制|法典编纂|十二铜表法|万民法|自然法|律师制度|法庭|诉讼|契约法|财产法|继承法|婚姻法|税法|关税|贸易法|海商法|柏拉图学园|亚里士多德学派|斯多葛学派|伊壁鸠鲁学派|犬儒学派|修辞学|逻辑学|伦理学|政治学|历史学|地理学|博物学|公共教育|图书馆|博物馆|科学院雏形|凯旋门|纪念柱|道路网|货币制度|银行雏形|信用票据'),
+  military: s('弩炮|配重投石机|罗马军团方阵|短剑|锁子甲|攻城塔|希腊火|铁浮桥|骑兵冲击|要塞体系|战象|铁蒺藜|龟甲阵|投枪|投石机|蝎式弩炮|连发弩炮|撞城车|挖掘地道|活动掩体|鹿角|拒马|陷阱|铁甲舰|撞角|船用弩炮|燃烧剂|生石灰弹|毒气雏形|烟幕|罗马短剑|罗马长矛|骑兵长矛|复合弓|皮甲|鳞甲|板甲雏形|头盔|盾牌|方阵|军团制|百人队|骑兵队|辅助军|工程兵|军医|军事工程|野战工事|围城工事|长城|边墙|军事道路|军粮储备|军马饲养|军事训练|军规|军法')
+}},
+{ name:'中世纪', en:'MEDIEVAL', y0:500, y1:1500, g:{
+  power: s('风车磨坊|潮汐磨坊|水轮鼓风|煤炭开采|水力锤锻|地热利用|风力锯木|木炭窑|蜡烛制造|鲸油灯|水车提水|风力提水|立式风车|塔式风车|风车磨面|风车锯木|风车造纸|风车排水|潮汐水车|水轮锤锻|水轮锯|水轮钻|水轮纺纱|水力鼓风机|木炭高炉|焦炭雏形|煤饼|煤球|煤矿排水|矿井升降|矿井照明|油气灯|鲸油蜡烛|蜂蜡蜡烛|松脂灯|街灯雏形'),
+  material: s('铸铁炮|乌兹钢|火药配方|肥皂|染料|玻璃镜片|眼镜|蒸馏器|机械钟|齿轮钟|纺车|脚踏织机|马镫|重犁|马蹄铁|焦炭雏形|黄铜合金|造纸|活字合金|钟表发条|彩色玻璃|罗盘磁针|坩埚|耐火砖|大马士革钢|布拉特钢|渗碳钢|水力锻锤|落锤|轧机雏形|拉丝机|拔丝工艺|铁丝|钢丝|黄铜|青铜|白铜|焊锡|焊料|铅管|铁管|铸铁锅|铸铁钟|铸钟术|砂型铸造|精密铸造|凸透镜|凹透镜|眼镜片|放大镜|望远镜雏形|显微镜雏形|眼镜架|玻璃窗|镶嵌工艺|珐琅|漆器|油纸|油布|防水布|碱洗|漂白|染色|印花|脚踏纺车|织布机|提花机雏形|针织|花边|丝绸|天鹅绒|毛呢|亚麻布'),
+  info: s('造纸术|雕版印刷|活字印刷|阿拉伯数字|代数学|光学|大学|百科全书|地图绘制|指南针|航海图|天文表|象限仪|密码学|复式记账|代数的符号|三角函数|透视法雏形|机械计算器雏形|泥活字|木活字|金属活字|印刷油墨|印刷机|书籍装订|手抄本|泥金装饰|犊皮纸|竹纸|宣纸|纸钞|纸币|汇票|信用状|保险单|小数|负数|方程求解|二次方程|三次方程|三角学|正弦表|余弦表|正切表|球面三角|航海历|星图|海图|航海罗盘|测深锤|六分仪雏形|十字测天仪|摆钟雏形|擒纵机构|发条|怀表|座钟|沙漏|暗号|密码本|透视法|暗箱|学位制|地图集|地理发现|新航路'),
+  bio: s('解剖学复兴|医院|外科手术|缝合|酒精麻醉|鸦片麻醉|人痘接种|眼镜|瘟疫隔离|药剂学|蒸馏酒精|助产钳|绷带|药膏|放血疗法改良|接骨|牙科|绷带消毒|骨骼解剖|肌肉解剖|血管解剖|神经解剖|外科器械|手术刀|镊子|止血钳|锯骨刀|截肢术|缝合术|伤口处理|骨折固定|脱臼复位|石膏|牵引|隔离病院|麻风病院|修道院医院|医生行会|药剂师行会|外科医生行会|草药学|矿物药|动物药|蒸馏术|酒精|烈酒|白兰地|膏药|丸剂|散剂|汤剂|栓剂|眼药水|拔罐|水蛭疗法|疫苗雏形|检疫|公共卫生|供水系统|浴场|拔牙|补牙|假牙'),
+  transport: s('磁罗盘|三桅帆船|船舵改良|运河船闸|驿站系统|蒙古驿道|拖曳运河|悬挂车架|四轮马车|灯塔改良|船坞|测深锤|卡拉维尔帆船|盖伦帆船|克拉克帆船|纵帆船|横帆船|三角帆|多桅船|大帆船|船首斜桅|船锚|船钟|航海指南|磁针|日晷|沙漏|摆钟|驿站|驿道|邮驿|马匹更换站|信鸽|旗语|灯火信号|拖船道|干船坞|起重机|邮政马车|公共马车|轿子|滑雪板|雪鞋|狗拉雪橇|驯鹿雪橇'),
+  society: s('封建制|行会|大学制度|银行|复式记账|保险|议会|大宪章|法律体系|城市自治|修道院|朝圣网络|市集|汉萨同盟|采邑制|骑士制度|领主|封臣|农奴|自由民|学徒制|商会|市议会|市长|市政厅|学位|学院|图书馆|抄书室|教堂|主教|教皇|宗教法庭|宗教裁判所|十字军|骑士团|朝圣|大教堂|哥特建筑|罗曼建筑|城堡|护城河|吊桥|城门|瞭望塔|三级会议|普通法|陪审团|律师|钱庄|海上保险|商路|博览会|金本位雏形|银本位|税收|关税'),
+  military: s('火药武器|火炮|手炮|火绳枪|板甲|城堡|十字弓|长弓|攻城炮|星形要塞|壕沟防御|地雷|燃烧弹|火门枪|燧发枪雏形|步枪|射石炮|青铜炮|铸铁炮|臼炮|长管炮|霰弹|榴弹|火箭|毒气弹雏形|黑火药|粒状火药|火药研磨|硝石提炼|硫磺提炼|全身甲|半身甲|头盔|护手|护腿|鳞甲|皮甲|胸甲|盾牌|复合弓|弩|攻城塔|撞城车|云梯|投石机|护城河|吊桥|箭塔|壕沟|拒马|铁蒺藜|陷阱')
+}},
+{ name:'文艺复兴', en:'RENAISSANCE', y0:1500, y1:1750, g:{
+  power: s('煤炭供暖|蒸汽泵|大气压实验|气压动力|风力锯木|煤气照明雏形|水力纺织|热机雏形|真空动力|真空泵|空气泵|气压计|温度计|湿度计|风速计|风力锯|风力纺纱|风力造纸|水力纺纱机|水力织布机|水力锻锤|水力钻床|水力磨坊|水力鼓风|煤炭炼焦|焦炭高炉|煤气照明|煤气发生炉|煤气管道|活塞泵|大气压机|热机模型|蒸汽喷射|蒸汽球|蒸汽轮机雏形|风箱改良|齿轮传动|皮带传动|链条传动|凸轮传动|曲柄连杆|飞轮|调速器雏形|气缸雏形'),
+  material: s('现代高炉|焦炭冶炼|玻璃透镜|显微镜|望远镜|精密钟表|摆钟|弹簧|坩埚|硫酸|硝酸|磷|锌冶炼|铜版印刷|彩色玻璃|精密齿轮|石英砂玻璃|温度计玻璃|高炉炼铁|焦炭炼铁|熟铁|生铁|坩埚钢|渗碳钢|淬火|回火|退火|表面硬化|金属抛光|钟表齿轮|发条|轴承|螺旋弹簧|钟表游丝|螺旋测微器雏形|精密螺丝|车床雏形|镗床雏形|铣床雏形|磨床雏形|钻床|磨镜机|透镜研磨|复合显微镜|单摆|发条钟|怀表|精密天文钟|平板玻璃|镜面玻璃|透镜玻璃|光学玻璃|铅玻璃|水晶玻璃|化学玻璃|盐酸|王水|硫|硫酸盐|硝酸盐|火药精炼|染料化学|颜料合成|普鲁士蓝|群青|铅白|锌白|朱砂|胭脂红|靛蓝|茜素|印刷油墨|蚀刻版画|铅字合金|印刷机|造纸机雏形'),
+  info: s('印刷机|透视法|日心说|开普勒定律|牛顿力学|微积分|对数|解析几何|显微镜观测|望远镜观测|科学方法|百科全书|报纸|地图投影|真空泵|温度计|气压计|摆的等时性|代数符号|概率论|坐标系|二项式定理|万有引力|光学色散|地动说|椭圆轨道|行星运动三大定律|牛顿三大定律|导数|积分|极限|无穷级数|自然对数|常用对数|计算尺|笛卡尔坐标|极坐标|方程论|韦达定理|组合数学|三角函数表|球面三角|光学|反射定律|折射定律|色散|光谱|望远镜|显微镜|细胞观察|微生物观察|大气压|气体定律|波义耳定律|湿度计|单摆周期|钟表|摆钟|精密钟表|归纳法|演绎法|实验方法|科学院|皇家学会|期刊|墨卡托投影|经纬度|地球测量|天文观测|星表|日食月食|彗星研究|太阳黑子|木星卫星|土星光环|银河观测'),
+  bio: s('血液循环|人体解剖|接种法|外科手术|微生物观察|植物分类|药物学|产钳|听诊雏形|输液|体温计|病理解剖|卫生学|眼科器械|心脏解剖|血管解剖|哈维血液循环|输血|解剖学|人体结构|骨骼系统|肌肉系统|神经系统|呼吸系统|消化系统|截肢术|肿瘤切除|疝气手术|膀胱结石手术|白内障手术|剖腹产|助产术|人痘接种|疫苗雏形|细菌观察|显微镜检查|动物分类|植物标本|标本保存|化学药物|蒸馏术|提取术|结晶|过滤|沉淀|听诊器雏形|脉搏计|血压计雏形|静脉注射|绷带|石膏|夹板|尸体解剖|公共卫生|下水道|供水系统|医院|隔离|检疫|眼镜|放大镜|显微镜'),
+  transport: s('卡拉维尔帆船|六分仪|经纬仪|精密海图|四轮马车|运河|邮政系统|潜水钟|热气球雏形|船舶压舱|纵帆船|盖伦帆船|克拉克帆船|大帆船|横帆船|多桅帆船|船首斜桅|船尾楼|船舵|船锚|船钟|测深锤|象限仪|星盘|航海钟雏形|航海图|海图|罗盘|磁偏角|测距仪|水准仪|望远镜|悬挂马车|公共马车|邮政马车|驿站|邮驿|信鸽|旗语|灯火信号|船闸|拖船道|港口|码头|灯塔|船坞|干船坞|起重机|潜水服雏形|热气球|氢气球雏形|降落伞雏形|降落伞|滑翔机雏形'),
+  society: s('文艺复兴|人文主义|宗教改革|科学学会|专利制度|股份公司|证券交易所|启蒙思想|社会契约|百科全书派|公共教育|新闻自由|博物馆|科学院|新教|天主教改革|反宗教改革|科学革命|启蒙运动|理性主义|经验主义|三权分立|天赋人权|自由平等博爱|民主思想|共和主义|民族国家|主权国家|国际法|格劳秀斯|版权|知识产权|合股公司|东印度公司|中央银行|信用|保险|海上保险|人寿保险|义务教育|大学改革|皇家学会|法兰西科学院|图书馆|期刊|出版自由|咖啡馆|沙龙|共济会|文人共和国'),
+  military: s('火绳枪|燧发枪|刺刀|线式战术|海军火炮|棱堡|军舰|手榴弹|信号旗|军事工程学|弹道学|击发枪|来复枪|线膛枪|步枪|手枪|左轮手枪雏形|火炮|青铜炮|铸铁炮|榴弹炮|臼炮|舰炮|岸防炮|霰弹|榴弹|火箭弹|黑火药|无烟火药雏形|火药配方改良|弹道计算|射表|瞄准具|枪刺|剑|军刀|佩剑|盔甲|胸甲|头盔|护手|盾牌|星形要塞|要塞|城堡|壕沟|铁蒺藜|拒马|军旗|军鼓|军号|队列训练|军事工程|军事地图|军事测绘|军工产业|兵工厂|造船厂|海军|战列舰|护卫舰|纵火船|火船|水雷雏形|鱼雷雏形|潜艇雏形|潜水钟')
+}},
+{ name:'工业革命', en:'INDUSTRIAL', y0:1750, y1:1900, g:{
+  power: s('蒸汽机|瓦特蒸汽机|高压蒸汽机|煤气照明|水轮机|石油钻井|煤油灯|锅炉技术|火力发电雏形|蒸汽轮机雏形|地下煤气化|压缩空气动力|纽科门蒸汽机|双作用蒸汽机|蒸汽机车|蒸汽船|蒸汽泵|蒸汽锤|内燃机雏形|煤气机|汽油机雏形|柴油机雏形|水轮发电机雏形|火力发电|燃煤发电|汽油灯|乙炔灯|电弧灯|白炽灯雏形|电池|伏打电堆|蓄电池|燃料电池雏形|石油精炼|煤油|汽油|柴油|润滑油|天然气开采|煤气化|焦炉煤气|压缩空气|空气压缩机|气动工具'),
+  material: s('坩埚钢|贝塞麦炼钢|平炉炼钢|波特兰水泥|橡胶硫化|赛璐珞|合成染料|安全火柴|磷火柴|平板玻璃|电镀|铝冶炼|锌白颜料|硝化棉|硬质合金|沥青路面|钢筋混凝土|镍钢|贝塞麦转炉|托马斯炼钢|电炉炼钢雏形|合金钢|锰钢|铬钢|钨钢|工具钢|高速钢|不锈钢雏形|熟铁|生铁|铸铁|可锻铸铁|球墨铸铁|钢板|钢轨|钢管|钢丝|铁丝|铁钉|螺丝|螺栓|螺母|轴承|弹簧钢|钢丝绳|预应力混凝土|浮法玻璃雏形|玻璃瓶|玻璃管|光学玻璃|硬橡胶|橡胶轮胎|塑料雏形|胶木|电木|苯胺染料|茜素红|靛蓝合成|品红|甲基紫|黄磷|红磷|电解|电镀镍|电镀铬|电解铝|锌白|铅白|钛白|硝化甘油|火药棉|无烟火药|碳化钨|沥青|柏油|石油沥青'),
+  info: s('电报|摩尔斯电码|电话|打字机|差分机|分析机|穿孔卡|摄影术|胶印|便士报|铁路电报网|天文台|气象图|统计学|指纹识别|留声机|麦克风|测距仪|密码电报|有线电报|无线电报雏形|电报网|海底电缆|跨洋电缆|贝尔电话|电话交换机|电话网络|打字电报机|传真机雏形|复印机雏形|唱片|录音机|扬声器|耳机|无线电雏形|电磁波|电磁学|麦克斯韦方程|赫兹实验|无线电通信|无线电广播|银版摄影|湿版摄影|干版摄影|胶卷|相机|快门|闪光灯|电影|活动电影|放映机|动画|轮转印刷机|石印|彩色印刷|期刊|杂志|图书出版|图书分类|人口统计|气象预报|天文望远镜|光谱分析|密码学|密码机|计算机雏形'),
+  bio: s('牛痘疫苗|乙醚麻醉|氯仿麻醉|消毒法|细菌学|听诊器|缝合线|输血|吗啡|奎宁|体温计|显微镜改良|公共卫生|护理学|疫苗冷藏|组织学|麻醉机雏形|血细胞观察|天花疫苗|狂犬疫苗|霍乱疫苗|伤寒疫苗|卡介苗雏形|白喉抗毒素|破伤风抗毒素|笑气麻醉|局部麻醉|可卡因麻醉|石炭酸消毒|高温消毒|无菌操作|微生物学|细菌染色|细菌培养|培养基|复式显微镜|电子显微镜雏形|血压计|脉搏计|心电图雏形|X光雏形|肠线|丝线|止血钳|手术镊|手术剪|血型|血液保存|鸦片|可待因|阿司匹林|水杨酸|药物化学|制药工业|护士学校|南丁格尔|下水道|供水系统|垃圾处理|冷链|细胞学|病理学|解剖学|生理学'),
+  transport: s('蒸汽机车|铁路|蒸汽船|螺旋桨|铁桥|自行车|汽车|热气球|潜水艇|苏伊士运河|钢轨|缆车|电梯|蒸汽拖拉机|气动刹车|铁路网|枕木|道钉|信号系统|铁路信号|车站|火车站|调度系统|轮船|铁壳船|钢壳船|钢桥|悬索桥雏形|拱桥|隧道|地铁雏形|地下铁道|脚踏车|三轮车|内燃机汽车|蒸汽汽车|电动车雏形|公共马车|公共汽车雏形|出租车|升降机|蒸汽犁|蒸汽压路机|氢气球|飞艇雏形|滑翔机|飞机雏形|潜艇|潜水钟|水雷|鱼雷|巴拿马运河雏形|运河|船闸|港口|码头|灯塔|航标|空气制动|真空制动|铁路制动'),
+  society: s('工厂制|工会|义务教育|公共卫生法案|选举改革|公司法|保险业|百货商店|马克思主义|日报|城市排水|警察制度|摄影新闻|邮政汇兑|工厂法|工人运动|罢工|劳工法|童工法|工时限制|公立学校|大学改革|自来水|煤气供应|街道照明|现代警察|监狱改革|精神病院|社会福利|社会保险|养老金|普选权|妇女参政权|议会改革|有限责任公司|股份公司|股票市场|证券交易所|银行|中央银行|货币制度|金本位|人寿保险|火灾保险|海上保险|连锁店|邮购|邮政系统|邮票|包裹邮寄|电报汇款|大众报纸|新闻业|战地记者|广告业|社会主义|共产主义|工会运动|第一国际|第二国际'),
+  military: s('后装步枪|机枪|铁甲舰|无烟火药|鱼雷|手榴弹|铁丝网|堑壕战|爆破筒|装甲列车|水雷|探照灯|针发枪|毛瑟枪|来复枪|线膛枪|加特林机枪|马克沁机枪|重机枪|轻机枪雏形|手枪|左轮手枪|自动手枪|火炮|后装炮|线膛炮|榴弹炮|臼炮|迫击炮|舰炮|岸防炮|高射炮雏形|硝化棉|硝化甘油|雷管|引信|炮弹|穿甲弹|霰弹|战列舰|巡洋舰|驱逐舰|鱼雷艇|潜艇|枪榴弹|堑壕|战壕|掩体|地堡|炸药包|装甲车|坦克雏形|信号弹|照明弹|烟幕弹|毒气弹|防毒面具|军用地图|军事测绘|参谋部|军事学院|兵役制|征兵制|总动员')}},
+{ name:'信息技术', en:'ELECTRIC & INFO', y0:1900, y1:1980, g:{
+  power: s('发电机|电动机|白炽灯|交流电|变压器|水力发电|内燃机|柴油机|喷气发动机|燃气轮机|核裂变|核电站|太阳能电池|地热发电|燃料电池|输电网|汽油精炼|液化天然气|超高压输电|直流发电机|交流发电机|感应电动机|交流输电|高压输电|电网|智能电网雏形|水电站|火力发电|燃煤电厂|燃气电厂|燃油电厂|汽油机|涡喷发动机|涡扇发动机|火箭发动机|固体火箭|液体火箭|离子推进器雏形|核反应堆|压水堆|沸水堆|快中子堆|核聚变实验|托卡马克|激光聚变|光伏电池|太阳能热发电|潮汐发电|风力发电|海上风电|氢能|生物质能|沼气发电|垃圾发电|储能|抽水蓄能|压缩空气储能|飞轮储能|锂电池雏形|铅酸电池|镍镉电池|镍氢电池|超级电容|超导输电|无线输电|微波输电'),
+  material: s('合金钢|不锈钢|铝合金|电木|尼龙|聚乙烯|硅胶|碳纤维|半导体硅|超导材料|钛合金|预应力混凝土|复合材料|人造橡胶|荧光粉|液晶|单晶硅|光刻胶|稀土永磁|陶瓷电容|铬钢|镍钢|钼钢|钒钢|工具钢|高速钢|硬质合金|碳化钨|镁合金|铜合金|黄铜|青铜|铍铜|形状记忆合金|低温超导|高温超导|多晶硅|非晶硅|锗半导体|砷化镓|氮化镓|碳化硅|集成电路材料|掩膜版|掺杂工艺|离子注入|薄膜沉积|化学机械抛光|酚醛树脂|环氧树脂|涤纶|腈纶|聚丙烯|聚氯乙烯|聚苯乙烯|聚碳酸酯|有机玻璃|特氟龙|橡胶|合成橡胶|玻璃纤维|芳纶纤维|凯夫拉|发光二极管|液晶显示|等离子显示|阴极射线管|钕铁硼|钐钴|压电陶瓷|铁电材料|铁氧体|磁性材料|石英玻璃|微晶玻璃'),
+  info: s('电话网络|无线电|真空管|晶体管|集成电路|电子计算机|ENIAC|图灵机|编程语言|操作系统|ARPANET|卫星通信|激光|光纤|雷达|电视|磁带|硬盘|微处理器|个人电脑|Unix|C语言|图形界面|鼠标|复印机|传真机|调制解调器|磁芯存储器|汇编语言|编译器|数据库|关系模型|晶体管收音机|无线电广播|调幅广播|调频广播|短波通信|微波通信|通信卫星|全球定位系统雏形|声呐|电子对抗|电子战|三极管|五极管|显像管|点接触晶体管|面接触晶体管|场效应晶体管|小规模集成电路|中规模集成电路|大规模集成电路|超大规模集成电路|EDVAC|冯诺依曼架构|图灵测试|人工智能雏形|机器语言|FORTRAN|COBOL|ALGOL|BASIC|Pascal|C++|Java|Python|JavaScript|批处理系统|分时系统|Linux|Windows|macOS|DOS|键盘|显示器|打印机|扫描仪|局域网|广域网|互联网雏形|电子邮件|文件传输|远程登录|万维网雏形|超文本|浏览器雏形|搜索引擎雏形|SQL|Oracle|MySQL|软盘|光盘|U盘|固态硬盘|内存|RAM|ROM|闪存|穿孔纸带|解释器|进程调度|内存管理|文件系统|网络协议|TCP/IP|HTTP|HTML|CSS|XML|JSON'),
+  bio: s('X光|心电图|胰岛素|青霉素|磺胺药|多价疫苗|血型|输血|麻醉机|抗生素|DNA双螺旋|口服避孕药|透析|心脏起搏器|器官移植|脊髓灰质炎疫苗|重症监护|医用超声|内窥镜|脑电图|人工关节|疫苗冷链|抗生素耐药研究|X光机|CT雏形|肌电图|B超|胃镜|腹腔镜|关节镜|电子显微镜|扫描电镜|透射电镜|原子力显微镜|人工胰岛素|链霉素|四环素|氯霉素|抗菌药|抗病毒药|卡介苗|麻疹疫苗|腮腺炎疫苗|风疹疫苗|乙肝疫苗|基因|染色体|DNA测序雏形|遗传学|孟德尔定律|ABO血型|Rh血型|血液保存|血浆|血小板|呼吸机|心肺机|人工肾|人工心脏|人工晶体|肾移植|肝移植|心脏移植|骨髓移植|ICU|免疫疗法|化疗|放疗|靶向治疗|激素治疗|超级细菌|基因工程雏形|PCR技术雏形|克隆雏形|干细胞雏形'),
+  transport: s('汽车量产|飞机|直升机|喷气客机|火箭|人造卫星|载人航天|阿波罗登月|高速公路|集装箱运输|地铁|高铁|核潜艇|雷达导航|超音速飞行|航天飞机雏形|深潜器|福特流水线|汽车工业|内燃机汽车|柴油车|电动车|混合动力车|立交桥|轻轨|有轨电车|无轨电车|公交车|卡车|拖拉机|摩托车|自行车改良|莱特兄弟飞机|螺旋桨飞机|喷气式飞机|超音速飞机|旋翼机|滑翔机|飞艇|齐柏林飞艇|降落伞|弹射座椅|液体燃料火箭|固体燃料火箭|多级火箭|斯普特尼克|气象卫星|侦察卫星|导航卫星|GPS|加加林|空间站|航天飞机|火星探测器|月球探测器|金星探测器|旅行者号|潜艇|常规潜艇|潜水器|水下机器人|集装箱|集装箱船|油轮|散货船|滚装船|航空货运|航空邮件|铁路货运|管道运输|高速铁路|磁悬浮雏形|惯性导航|自动驾驶雏形'),
+  society: s('福利国家|联合国|人权宣言|大众媒体|广播|电视|信用卡|超市|航空旅行|环保运动|绿色革命|人口统计|互联网文化雏形|奥林匹克转播|社会保障|医疗保险|养老保险|失业保险|公共住房|国际联盟|世界人权宣言|国际法|国际法庭|维和部队|有线电视|卫星电视|大众娱乐|电影产业|好莱坞|唱片业|流行音乐|摇滚乐|爵士乐|借记卡|自动取款机|连锁店|快餐文化|购物中心|电子商务雏形|民航|喷气时代|大众旅游|环境保护|绿色和平|可持续发展|农业机械化|化肥|农药|杂交育种|人口爆炸|计划生育|黑客文化|开源运动|世界杯|奥运会|大众体育|妇女解放|民权运动|反战运动|嬉皮士|青年文化'),
+  military: s('坦克|军用飞机|航空母舰|雷达|声呐|导弹|原子弹|氢弹|喷气战斗机|核潜艇|化学武器|生物武器|电子战|弹道导弹|直升机作战|装甲车|自行火炮|坦克歼击车|喷气轰炸机|喷气攻击机|武装直升机|运输机|空中加油机|预警机|电子战飞机|无人侦察机|战列舰|巡洋舰|驱逐舰|护卫舰|攻击核潜艇|战略核潜艇|巡航导弹|反舰导弹|防空导弹|反坦克导弹|空空导弹|地空导弹|洲际导弹|潜射导弹|中子弹|核弹头|核威慑|相控阵雷达|主动声呐|被动声呐|电子干扰|电子侦察|神经毒气|芥子气|炭疽|肉毒杆菌|导弹防御|反导系统|激光制导|红外制导|GPS制导|精确制导|隐身技术雏形|夜视仪|红外成像')
+}},
+{ name:'数字智能', en:'DIGITAL & AI', y0:1980, y1:2025, g:{
+  power: s('光伏发电|风力发电|锂离子电池|燃料电池|核聚变实验|智能电网|储能电站|氢能|钙钛矿电池|钠离子电池|小型模块化核反应堆|无线充电|超导输电|虚拟电厂|固态电池|晶硅光伏|薄膜光伏|有机光伏|聚光太阳能|陆上风电|高空风电|垂直轴风机|磷酸铁锂|三元锂|液流电池|质子交换膜|固体氧化物|绿氢|蓝氢|电解水制氢|储氢材料|加氢站|仿星器|激光惯性约束|国家点火装置|第四代反应堆|钍基熔盐堆|微电网|需求响应|超导磁储能|磁共振无线充电|激光输电|常温超导|能源互联网|分布式能源|碳中和|碳捕集|碳封存|地热能|潮汐能|波浪能|海洋能|绿色能源|可再生能源'),
+  material: s('碳纳米管|石墨烯|3D打印|超材料|纳米材料|高温超导|金属玻璃|量子点|生物可降解塑料|金属有机框架|气凝胶|自修复材料|二维材料|钙钛矿材料|MXene材料|单壁碳纳米管|多壁碳纳米管|氧化石墨烯|石墨炔|碳气凝胶|纳米颗粒|纳米线|纳米管|纳米薄膜|量子阱|超晶格|二硫化钼|黑磷|六方氮化硼|共价有机框架|多孔材料|硅气凝胶|钇钡铜氧|铁基超导体|非晶合金|自愈合混凝土|自修复涂层|负折射率材料|声学超材料|力学超材料|隐身超材料|光固化打印|熔融沉积|选择性激光烧结|电子束熔化|生物打印|4D打印|聚乳酸|聚羟基脂肪酸酯|液态金属|镓基液态金属|钙钛矿太阳能|钙钛矿发光|稀土材料|永磁材料|发光材料|储能材料|催化材料|膜材料|半导体材料|第三代半导体|宽禁带半导体|量子材料|拓扑绝缘体|马约拉纳费米子'),
+  info: s('微处理器|个人电脑|图形界面|互联网|万维网|搜索引擎|电子邮件|手机|智能手机|WiFi|GPS|云计算|大数据|人工智能|深度学习|GPU计算|量子计算|区块链|加密货币|虚拟现实|增强现实|元宇宙|大语言模型|神经网络芯片|边缘计算|物联网|1G|2G|3G|4G|5G|6G|自动驾驶|计算机视觉|语音识别|推荐算法|开源软件|Linux|Python|容器技术|微服务|数字孪生|联邦学习|扩散模型|多模态模型|智能体|机器人流程自动化|量子密钥分发|神经网络架构搜索|向量数据库|提示工程|端侧AI|微信|微信支付|抖音|哔哩哔哩|快手|Google|YouTube|TikTok|美团|淘宝|支付宝|京东|拼多多|小红书|微博|知乎|豆瓣|百度|高德地图|腾讯视频|爱奇艺|优酷|网易云音乐|QQ音乐|Spotify|Netflix|Discord|Telegram|WhatsApp|Instagram|Facebook|Twitter/X|Reddit|Wikipedia|ChatGPT|Claude|Copilot|Midjourney|Stable Diffusion|Notion|Figma|Slack|Zoom|Teams|钉钉|飞书|企业微信|WPS|Google Docs|Excel|Word|PowerPoint|Trello|Jira|GitHub|GitLab|VSCode|IntelliJ|Xcode|Android Studio|Postman|Docker|Kubernetes|AWS|Azure|阿里云|腾讯云|华为云|Vercel|Nginx|Redis|MySQL|PostgreSQL|MongoDB|Elasticsearch|Kafka|TensorFlow|PyTorch|Hugging Face|OpenAI API|LangChain|OpenCV|Pandas|NumPy|Jupyter|Anaconda|Tableau|Power BI|Grafana|Prometheus|我的世界|王者荣耀|原神|英雄联盟|CS:GO|Dota2|绝地求生|塞尔达传说|艾尔登法环|GTA|使命召唤|魔兽世界|最终幻想|暗黑破坏神|星际争霸|文明|模拟人生|动物森友会|Steam|Epic Games|Xbox|PlayStation|VR Chat|Roblox|Among Us|愤怒的小鸟|糖果传奇|部落冲突|皇室战争|堡垒之夜|和平精英|穿越火线|守望先锋|APEX英雄|Valorant|增强现实眼镜|脑机接口雏形|数字人|虚拟偶像|AI绘画|AI写作|AI作曲|AI编程助手|代码自动补全|多模态大模型|视觉语言模型|强化学习|迁移学习|自监督学习|差分隐私|同态加密|零知识证明|分布式存储|IPFS|点对点网络|去中心化身份|Web3|DAO|NFT|元宇宙平台|数字孪生城市|智能交通|车路协同|智慧城市'),
+  bio: s('基因工程|PCR技术|DNA测序|人类基因组计划|克隆技术|干细胞|CRISPR基因编辑|mRNA疫苗|免疫疗法|靶向药物|机器人手术|人工心脏|脑机接口|个性化医疗|合成生物学|器官3D打印|CAR-T疗法|微生物组|远程医疗|基因治疗|蛋白质结构预测|抗衰老研究|类器官|单细胞测序|表观遗传编辑|重组DNA|基因克隆|实时定量PCR|数字PCR|一代测序|二代测序|三代测序|纳米孔测序|千人基因组|个人基因组|基因组编辑|碱基编辑|先导编辑|基因疫苗|DNA疫苗|病毒载体疫苗|腺病毒疫苗|PD-1抑制剂|TCR-T疗法|NK细胞疗法|单克隆抗体|双特异性抗体|抗体偶联药物|小分子靶向药|酪氨酸激酶抑制剂|蛋白酶抑制剂|胚胎干细胞|诱导多能干细胞|成体干细胞|类脑器官|器官芯片|生物3D打印|组织工程|人工心脏瓣膜|人工耳蜗|侵入式脑机|非侵入式脑机|神经假体|达芬奇手术|微创手术|互联网医院|可穿戴医疗|健康监测|连续血糖监测|智能药丸|精准医疗|伴随诊断|液体活检|肠道菌群|益生菌|噬菌体疗法|人工基因线路|人工细胞|最小基因组|AlphaFold|端粒延长|NAD+补充|雷帕霉素|二甲双胍|空间转录组|基因驱动|生物安全|生物伦理'),
+  transport: s('可回收火箭|国际空间站|火星车|深空探测器|电动车|自动驾驶汽车|超级高铁|无人机配送|电动飞机|可重复使用飞船|月球基地|小行星采矿|太空旅游|卫星互联网|离子推进器|系外行星探测|猎鹰9号|星舰|重型猎鹰|天宫空间站|好奇号|毅力号|祝融号|旅行者号|帕克太阳探测器|新视野号|朱诺号|嫦娥工程|月球采矿|太空酒店|亚轨道飞行|轨道飞行|星链|一网|低轨星座|霍尔推进器|太阳帆|核热推进|开普勒望远镜|詹姆斯韦伯望远镜|特斯拉|比亚迪|电动汽车|混合动力|插电混动|氢燃料电池车|L2自动驾驶|L3自动驾驶|L4自动驾驶|L5自动驾驶|无人驾驶出租|自动驾驶卡车|无人机快递|城市空中交通|eVTOL|飞行汽车|真空管道|磁悬浮列车|高温超导磁悬浮|高速铁路|复兴号|新干线|TGV|ICE|混动飞机|氢能飞机|航天飞机|空天飞机|太空电梯雏形|火星基地|太空殖民|太空太阳能|太空制造|太空采矿|轨道工厂|近地轨道旅游|太空葬礼'),
+  society: s('社交媒体|电子商务|共享经济|远程办公|数字支付|在线教育|开源社区|隐私保护|数字货币|算法治理|内容推荐|短视频|网络直播|零工经济|数字身份|跨境协作|脸书|推特|微博|微信朋友圈|Instagram|TikTok|抖音|快手|小红书|哔哩哔哩|YouTube|知乎|豆瓣|Reddit|淘宝|京东|拼多多|亚马逊|eBay|Shopify|支付宝|微信支付|Apple Pay|Google Pay|PayPal|比特币|以太坊|稳定币|央行数字货币|NFT|Uber|滴滴|Airbnb|共享单车|共享充电宝|Zoom|Teams|Slack|飞书|钉钉|Coursera|edX|可汗学院|网易云课堂|腾讯课堂|GitHub|GitLab|Stack Overflow|GDPR|差分隐私|端到端加密|零知识证明|算法推荐|内容审核|事实核查|直播带货|外卖骑手|网约车司机|自由职业|生物识别|人脸识别|指纹识别|远程协作|数字游民|元宇宙社交|虚拟偶像|数字人|电子竞技|直播平台|Twitch|B站直播|虎牙|斗鱼|在线社区|Discord|QQ|Telegram|即时通讯|短视频电商|社交电商|直播电商|数字娱乐|流媒体|网易云音乐|QQ音乐|Spotify|Netflix|爱奇艺|腾讯视频|智能家居|物联网家居|语音助手|Siri|Alexa|小爱同学|智能音箱|智能手表|智能眼镜|可穿戴设备|数字货币钱包|去中心化身份|DAO|Web3|元宇宙|虚拟地产|数字艺术'),
+  military: s('精确制导武器|隐身战机|无人机作战|网络战|电磁炮|激光武器|高超音速导弹|太空军事|AI自主武器|量子通信|电子对抗|蜂群无人机|定向能武器|GPS制导炸弹|激光制导炸弹|JDAM|F-22|F-35|歼-20|苏-57|隐身轰炸机|B-2|B-21|捕食者|死神|翼龙|彩虹|自杀式无人机|察打一体无人机|网络攻击|零日漏洞|高级持续性威胁|勒索软件|电磁轨道炮|电热化学炮|高能激光|激光防空|激光反导|乘波体|超燃冲压发动机|东风-17|锆石|反卫星武器|太空激光|轨道轰炸|X-37B|致命性自主武器|AI辅助决策|量子密钥分发|量子雷达|电子干扰|电子欺骗|微波武器|声波武器|粒子束武器|动能武器|电磁脉冲弹|中子弹|战术核武器|战略核潜艇|攻击核潜艇|无人潜艇|无人舰艇|航母战斗群|福特级航母|电磁弹射|隐身舰艇|濒海战斗舰|导弹防御|萨德|爱国者|铁穹|宙斯盾|太空态势感知|军事卫星|侦察卫星|预警卫星|军事AI|战场机器人|外骨骼|单兵系统|未来战士')
+}},
+{ name:'未来时代', en:'FUTURE', y0:2025, y1:5000, g:{
+  power: s('可控核聚变商用|反物质能源|零点能提取|戴森球|戴森云|戴森环|量子真空能|微型黑洞能|恒星引擎|黑洞发电|反物质推进|正反物质湮灭|卡西米尔效应能源|宇宙弦能|真空衰变能|质子衰变能|霍金辐射能|引力能|时空曲率能|奇点能|虫洞能|星际能源网|无线能量传输|激光能量束|微波能量束|反物质存储|反物质工厂|核聚变火箭|聚变推进器|反物质催化聚变|μ子催化聚变|冷核聚变|气泡聚变|惯性约束聚变|磁约束聚变|仿星器商用|托卡马克商用|球形托卡马克|场反位形|等离子体推进|磁等离子体推进|VASIMR推进|太阳帆推进|激光帆推进|微波帆推进|磁帆|电帆|核脉冲推进|猎户座计划|代达罗斯计划|巴萨德冲压引擎|聚变冲压引擎|反物质冲压引擎|戴森球建造|星球工程|恒星级工程|星系级工程|宇宙级工程|奇点反应堆|真空能反应堆|零点模块|无限能源|永动引擎|第二类永动机|反熵引擎|时间晶体能源|量子涨落能源|虚粒子能源|真空极化能源'),
+  material: s('可编程物质|中子星物质|夸克物质|奇异物质|超固态|金属氢|超流体|玻色-爱因斯坦凝聚|拓扑材料|时间晶体|负质量物质|负能量密度材料|维度折叠材料|超维度材料|光子晶体|声子晶体|磁单极子材料|空间扭曲材料|纳米组装|分子制造|原子级制造|自复制材料|智能材料|自适应材料|形态记忆合金|超弹性材料|超硬材料|超导材料室温|超流材料|量子材料|拓扑绝缘体商用|外尔半金属|狄拉克半金属|马约拉纳材料|任意子材料|分数量子霍尔材料|量子自旋液体|自旋冰|磁单极子晶体|暗物质材料|暗能量材料|弦论材料|卡拉比-丘材料|高维材料|全息材料|超材料隐身|光学隐身|声学隐身|热学隐身|量子隐身|完美吸收体|超黑材料|超白材料|超疏水材料|超亲水材料|自清洁材料|自愈合材料|生物矿化材料|仿生材料|蜘蛛丝钢|碳纳米管缆|石墨烯气凝胶|金刚石纳米线|硼烯|硅烯|锗烯|锡烯|磷烯|砷烯'),
+  info: s('通用人工智能|超级智能|人工意识|意识上传|数字永生|全脑仿真|量子互联网|量子计算机商用|光子计算机|DNA计算机|生物计算机|神经形态计算|类脑芯片|量子机器学习|量子霸权|量子优势|量子纠错|拓扑量子计算|任意子量子计算|马约拉纳量子比特|量子隐形传态|量子密钥分发|后量子密码学|脑脑接口|集体智能|蜂群智能|超级智能体|自主智能体|递归自我改进|智能爆炸|技术奇点|强人工智能|通用问题求解器|通用推理引擎|世界模型|具身智能|多模态超级智能|AI安全|AI伦理|AI治理|AI权利|AI人格|数字意识|机器意识|机器伦理|合成意识|分布式智能|群体意识|蜂群思维|星际互联网|量子网络|虫洞通信|中微子通信|引力波通信|超光速通信|量子纠缠通信|脑联网|神经互联网|意识互联网|元宇宙永久化|完全沉浸VR|脑机VR|梦中VR|共享梦境|记忆编辑|记忆植入|记忆删除|记忆备份|记忆恢复|人格备份|人格转移|人格复制|多重人格切换|数字分身|数字孪生人类|全息投影|全息存在|脑波输入|意念控制|情感计算'),
+  bio: s('永生技术|抗衰老|端粒酶激活|纳米医学|纳米机器人|基因修复|基因增强|人类增强|赛博格|生化人|器官培育|克隆人|人造子宫|合成生命|人工细胞|异种移植|异种器官|脑机融合|神经接口|感官增强|义眼义肢|仿生器官|血液替代|冷冻休眠|人体冷冻|意识转移|意识备份|数字副本|上传意识|基因编辑婴儿|设计婴儿|定制人类|超人主义|后人类|跨人类|基因疗法2.0|细胞重编程|干细胞器官|3D打印器官|4D打印器官|生物打印血管|生物打印心脏|人工子宫外孕育|男性怀孕|无性繁殖|单性繁殖|人工授精进化|体外配子|人造精子|人造卵子|基因库|冷冻卵子|冷冻精子|基因银行|生物银行|器官银行|血液工厂|人造血液|万能血型|纳米医生|医疗纳米机器人|细胞修复机器人|DNA修复机器人|端粒修复|线粒体修复|表观遗传修复|细胞再生|肢体再生|器官再生|神经再生|脑再生'),
+  transport: s('曲速引擎|阿库别瑞引擎|虫洞|可穿越虫洞|克尔黑洞|白洞|时空折叠|超空间|跃迁引擎|超光速通信|中微子通信|引力波通信|反重力|反重力飞行器|悬浮城市|轨道电梯|太空电梯|天钩|轨道环|星际飞船|世代飞船|殖民飞船|冬眠舱|曲速星舰|方舟飞船|诺亚方舟|戴森球飞船|冯诺依曼探测器|自我复制飞船|星际方舟|恒星飞船|聚变飞船|反物质飞船|核脉冲飞船|激光帆飞船|微波帆飞船|磁帆飞船|曲速飞船|虫洞飞船|超空间飞船|维度飞船|时间飞船|时空飞船|量子传送|物质传送|量子隐形传态运输|全息传送|瞬间移动|空间跳跃|星际跳跃|银河高速|星际航线|星际港口|太空城|奥尼尔圆柱|斯坦福圆环|伯纳尔球|戴森球居住区|行星改造|火星地球化|金星地球化|月球殖民|小行星采矿|彗星采矿|星际采矿|木星采矿|土星环采矿|戴森球采矿|奥尔特云文明|星际游牧'),
+  society: s('星际文明|卡尔达肖夫指数|II型文明|III型文明|后稀缺社会|后劳动社会|全民基本收入|星际联邦|银河帝国|跨星际外交|通用翻译|通用语言|星际法律|星际贸易|星际货币|元宇宙永久化|数字永生社会|虚拟世界居民|多重身份|集体意识|蜂群思维|群体智能社会|自动化政府|AI治理|算法民主|直接民主|流动性民主|共识决策|预测市场|社会信用进化|通用基本服务|资源导向经济|礼物经济|共享经济2.0|后资本主义|后社会主义|星际共产主义|星际乌托邦|戴森球文明|银河文明|宇宙文明|第一接触|外星文明|外星生命|费米悖论解答|大过滤器|黑暗森林|猎人假设|动物园假设|外星遗迹|外星科技|逆向工程|跨维度文明|时间旅行社会|多元宇宙|平行宇宙|量子多元宇宙|模拟假说|模拟宇宙|缸中之脑|玻尔兹曼大脑|意识上传社会|数字来世|数字天堂|虚拟伊甸园|超人类伦理|后人类伦理|机器伦理|AI权利|合成生命权利'),
+  military: s('引力武器|黑洞炸弹|反物质弹|维度武器|时间武器|因果武器|概率武器|量子武器|纳米武器|灰蛊|自我复制武器|冯诺依曼机器武器|智能武器|自主武器|蜂群武器|星舰武器|行星毁灭|恒星毁灭|星系毁灭|宇宙毁灭|维度撕裂|现实扭曲|现实工程|时空武器|时间旅行武器|祖父悖论武器|超光速导弹|曲速鱼雷|量子纠缠武器|意识武器|纳米病毒|基因武器|合成生物武器|AI病毒|量子病毒|计算机病毒终极版|赛博武器|网络空间武器|信息武器|模因武器|认知武器|心理武器|社会工程武器|经济武器|货币武器|贸易武器|资源武器|能量武器|反能量武器|零点能武器|真空衰变弹|奇异夸克弹|磁单极子武器|暗物质武器|暗能量武器|弦武器|膜武器|高维武器|维度封锁|维度打击|时空封锁|因果封锁|现实锁定|命运武器|运气武器|概率操纵武器|量子自杀武器|量子永生武器|全息武器|模拟武器')
+}}
+];
+ERA_DEFS.forEach((def, i) => {
+  def.idx = i;
+  def.range = '约' + formatYear(def.y0) + ' - ' + formatYear(def.y1);
+});
+/* 【为未来时代批量补充科技名】每个门类追加 genSci 生成的词
+   把 285 改大=未来科技更多、时间轴更长；改小则反之 */
+(function expandFuture(){
+  const f = ERA_DEFS[ERA_DEFS.length - 1];
+  const keys = ['power','material','info','bio','transport','society','military'];
+  const P = { power:V.powerP, material:V.matP, info:V.infoP, bio:V.bioP, transport:V.trP, society:V.socP, military:V.milP };
+  const B = { power:V.powerB, material:V.matB, info:V.infoB, bio:V.bioB, transport:V.trB, society:V.socB, military:V.milB };
+  const S = { power:V.powerS, material:V.matS, info:V.infoS, bio:V.bioS, transport:V.trS, society:V.socS, military:V.milS };
+  const offs = { power:3, material:7, info:11, bio:17, transport:23, society:29, military:37 };
+  keys.forEach(k => { f.g[k] = f.g[k].concat(genSci(P[k], B[k], S[k], 285, offs[k])); });
+})();
+/* 【全局去重】同一个科技名在所有时代里只保留最早出现的那一个，
+   否则"图书馆"这类名字会在多个时代重复生成节点 */
+const GLOBAL_DUP = new Set();
+/* 【门类交织】把七个门类按轮转顺序打散混排，并用固定种子洗牌，
+   避免同门类的科技扎堆出现在相邻位置 */
+function interleave(groups, seed){
+  const arrs = Object.entries(groups).map(([k, arr]) => ({ k, arr: arr.slice(), i: 0 }));
+  const out = [];
+  let rnd = seed >>> 0 || 1;
+  const rand = () => { rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; return rnd / 0x7fffffff; };
+  while(true){
+    const avail = arrs.filter(a => a.i < a.arr.length);
+    if(!avail.length) break;
+    for(let i = avail.length - 1; i > 0; i--){
+      const j = Math.floor(rand() * (i + 1));
+      const t = avail[i]; avail[i] = avail[j]; avail[j] = t;
+    }
+    for(const a of avail){
+      const nm = a.arr[a.i++];
+      if(GLOBAL_DUP.has(nm)) continue;
+      GLOBAL_DUP.add(nm);
+      out.push({ cat: a.k, name: nm });
+    }
+  }
+  return out;
+}
+/* ============================================================
+   【真实年份表】"科技名: 年份"（负数=公元前）
+   有年份的科技会按年份落在所属时代内的准确位置；
+   没写进来的则按顺序均匀铺开。
+   注意：键名必须与 ERA_DEFS 里的名字完全一致，否则不生效（死键）
+   ============================================================ */
+const KNOWN_YEARS = {
+  '火的使用':-1000000,'钻木取火':-500000,'打制石器':-2500000,'磨制石器':-10000,'陶器烧制':-20000,'弓与箭':-60000,'洞穴壁画':-40000,'结绳记事':-20000,'骨针缝合':-40000,'犬的驯化':-15000,'植物驯化':-9500,'小麦栽培':-9500,'水稻栽培':-8000,'马的驯化':-3500,'牛的驯化':-8000,'酿酒':-7000,'独木舟':-8000,'部落氏族':-100000,'火塘':-500000,'木炭烧制':-30000,
+  '骨器':-30000,'轮子':-3500,'青铜合金':-3300,'楔形文字':-3200,'甲骨文':-1200,'莎草纸':-3000,'金字塔':-2560,'法典':-1754,'马车':-2000,'帆船':-3000,'运河':-2300,'算盘':-500,'十进制计数':-400,'太阳历':-3000,'陶轮':-3500,'玻璃珠':-3500,'青铜犁':-1500,'青铜剑':-1600,'弩':-500,'城墙':-2500,
+  '货币':-1000,'学校':-2000,'铸铁':-500,'织布机':-4000,'染色工艺':-3000,'纺锤':-4000,'日晷':-1500,'水钟':-1500,'字母文字':-1050,'图书馆':-700,'天文观测':-3000,'地图绘制':-600,'高炉':-200,'罗马混凝土':-200,'欧几里得几何':-300,'地心说模型':150,'星盘':150,'羊皮纸':-200,'勾股定理':-500,'圆周率计算':-250,
+  '杠杆原理':-250,'齿轮传动':-250,'解剖学':-300,'外科手术器械':100,'公共卫生下水道':-600,'罗马大道':-300,'灯塔':-280,'船舵':100,'司南':-100,'罗马法':-450,'儒学':-500,'丝绸之路':-130,'弩炮':-350,'希腊火':672,'混凝土穹顶':126,'大理石切割':-400,'风车磨坊':1100,'煤炭开采':1200,'火药配方':850,'眼镜':1286,
+  '蒸馏器':800,'机械钟':1300,'纺车':1000,'马镫':400,'造纸术':105,'活字印刷':1040,'阿拉伯数字':800,'代数学':820,'大学':1088,'指南针':1088,'航海图':1300,'复式记账':1340,'银行':1407,'医院':1000,'人痘接种':1500,'磁罗盘':1187,'三桅帆船':1450,'四轮马车':1200,'火药武器':1100,'火炮':1332,
+  '火绳枪':1450,'城堡':1066,'长弓':1200,'雕版印刷':600,'手抄本':500,'沙漏':1338,'蒸汽泵':1698,'望远镜':1608,'显微镜':1590,'摆钟':1656,'印刷机':1440,'日心说':1543,'开普勒定律':1609,'牛顿力学':1687,'微积分':1684,'对数':1614,'解析几何':1637,'科学方法':1620,'百科全书':1751,'报纸':1609,
+  '温度计':1593,'气压计':1643,'万有引力':1687,'血液循环':1628,'人体解剖':1543,'接种法':1721,'六分仪':1731,'热气球':1783,'文艺复兴':1400,'宗教改革':1517,'专利制度':1474,'股份公司':1602,'启蒙思想':1700,'科学院':1660,'玻璃透镜':1280,'蒸汽机':1712,'瓦特蒸汽机':1776,'铁路':1825,'蒸汽船':1807,'螺旋桨':1836,
+  '电报':1837,'摩尔斯电码':1838,'电话':1876,'摄影术':1826,'留声机':1877,'牛痘疫苗':1796,'乙醚麻醉':1846,'消毒法':1867,'细菌学':1876,'听诊器':1816,'输血':1818,'公共卫生':1848,'护理学':1860,'贝塞麦炼钢':1856,'平炉炼钢':1864,'波特兰水泥':1824,'橡胶硫化':1839,'合成染料':1856,'安全火柴':1844,'铝冶炼':1855,
+  '钢筋混凝土':1849,'工厂制':1771,'工会':1824,'义务教育':1833,'马克思主义':1848,'日报':1702,'警察制度':1829,'后装步枪':1848,'机枪':1862,'铁甲舰':1859,'鱼雷':1866,'铁丝网':1874,'发电机':1866,'电动机':1834,'白炽灯':1879,'交流电':1886,'内燃机':1859,'柴油机':1892,'无线电':1895,'真空管':1904,
+  '晶体管':1947,'集成电路':1958,'电子计算机':1946,'ENIAC':1946,'图灵机':1936,'编程语言':1957,'操作系统':1956,'ARPANET':1969,'卫星通信':1962,'激光':1960,'光纤':1966,'雷达':1935,'电视':1925,'磁带':1928,'硬盘':1956,'微处理器':1971,'个人电脑':1975,'Unix':1969,'C语言':1972,'图形界面':1973,
+  '鼠标':1964,'X光':1895,'心电图':1903,'胰岛素':1921,'青霉素':1928,'抗生素':1928,'DNA双螺旋':1953,'心脏起搏器':1958,'器官移植':1954,'汽车量产':1908,'飞机':1903,'直升机':1939,'喷气客机':1952,'火箭':1926,'人造卫星':1957,'载人航天':1961,'阿波罗登月':1969,'高铁':1964,'核潜艇':1954,'联合国':1945,
+  '人权宣言':1948,'广播':1920,'信用卡':1950,'坦克':1916,'航空母舰':1917,'导弹':1944,'原子弹':1945,'氢弹':1952,'喷气战斗机':1942,'电子战':1940,'弹道导弹':1944,'光伏发电':1954,'风力发电':1887,'锂离子电池':1991,'燃料电池':1839,'核聚变实验':1951,'智能电网':2005,'氢能':1970,'钙钛矿电池':2009,'固态电池':2010,
+  '碳纳米管':1991,'石墨烯':2004,'3D打印':1984,'超材料':2000,'高温超导':1986,'量子点':1981,'气凝胶':1931,'自修复材料':2001,'互联网':1969,'万维网':1989,'搜索引擎':1990,'电子邮件':1971,'手机':1973,'智能手机':2007,'WiFi':1997,'GPS':1978,'云计算':2006,'大数据':2001,'人工智能':1956,'深度学习':2012,
+  'GPU计算':2006,'量子计算':1982,'区块链':2008,'加密货币':2009,'虚拟现实':1968,'增强现实':1990,'元宇宙':1992,'大语言模型':2018,'神经网络芯片':2016,'边缘计算':2013,'物联网':1999,'5G':2019,'6G':2030,'4G':2009,'3G':2001,'2G':1991,'1G':1979,'自动驾驶':2009,'计算机视觉':1960,'语音识别':1952,
+  '推荐算法':2000,'开源软件':1983,'Linux':1991,'Python':1991,'容器技术':2013,'微服务':2011,'数字孪生':2003,'联邦学习':2017,'扩散模型':2015,'多模态模型':2021,'智能体':2023,'端侧AI':2018,'微信':2011,'微信支付':2013,'抖音':2016,'快手':2011,'Google':1998,'YouTube':2005,'TikTok':2016,'美团':2010,
+  '淘宝':2003,'支付宝':2004,'京东':1998,'拼多多':2015,'小红书':2013,'微博':2009,'知乎':2011,'豆瓣':2005,'百度':2000,'高德地图':2002,'网易云音乐':2013,'QQ音乐':2005,'Spotify':2006,'Netflix':1997,'Discord':2015,'Telegram':2013,'WhatsApp':2009,'Instagram':2010,'Facebook':2004,'ChatGPT':2022,
+  'Claude':2023,'Copilot':2021,'Midjourney':2022,'Stable Diffusion':2022,'Figma':2012,'Zoom':2011,'钉钉':2014,'飞书':2019,'GitHub':2008,'Docker':2013,'Kubernetes':2014,'AWS':2006,'阿里云':2009,'TensorFlow':2015,'PyTorch':2016,'我的世界':2011,'王者荣耀':2015,'原神':2020,'英雄联盟':2009,'Dota2':2013,
+  '绝地求生':2017,'塞尔达传说':1986,'艾尔登法环':2022,'GTA':1997,'使命召唤':2003,'魔兽世界':2004,'星际争霸':1998,'Steam':2003,'PlayStation':1994,'Roblox':2006,'堡垒之夜':2017,'和平精英':2019,'守望先锋':2016,'Valorant':2020,'脑机接口':1973,'数字人':2001,'虚拟偶像':2007,'AI绘画':2021,'AI写作':2019,'AI编程助手':2021,
+  '多模态大模型':2021,'视觉语言模型':2021,'强化学习':1954,'迁移学习':1993,'自监督学习':2018,'差分隐私':2006,'同态加密':1978,'零知识证明':1985,'IPFS':2014,'去中心化身份':2015,'Web3':2014,'DAO':2016,'NFT':2014,'元宇宙平台':2021,'数字孪生城市':2018,'智慧城市':2008,'基因工程':1973,'PCR技术':1983,'DNA测序':1977,'人类基因组计划':1990,
+  '克隆技术':1996,'干细胞':1961,'CRISPR基因编辑':2012,'mRNA疫苗':2020,'免疫疗法':2011,'靶向药物':2001,'机器人手术':1985,'人工心脏':1982,'个性化医疗':2015,'合成生物学':2000,'器官3D打印':2003,'CAR-T疗法':2017,'微生物组':2001,'远程医疗':1959,'基因治疗':1990,'蛋白质结构预测':2020,'抗衰老研究':1930,'类器官':2009,'单细胞测序':2009,'表观遗传编辑':2016,
+  '可回收火箭':2015,'国际空间站':1998,'火星车':1997,'深空探测器':1977,'电动车':2008,'自动驾驶汽车':2015,'超级高铁':2013,'无人机配送':2013,'电动飞机':2015,'可重复使用飞船':2015,'月球基地':2030,'太空旅游':2001,'卫星互联网':2015,'离子推进器':1964,'系外行星探测':1992,'猎鹰9号':2010,'星舰':2023,'天宫空间站':2021,'好奇号':2011,'毅力号':2020,
+  '祝融号':2021,'帕克太阳探测器':2018,'詹姆斯韦伯望远镜':2021,'特斯拉':2003,'比亚迪':1995,'复兴号':2017,'新干线':1964,'TGV':1981,'航天飞机':1981,'社交媒体':1997,'电子商务':1995,'共享经济':2008,'远程办公':1973,'数字支付':1994,'在线教育':2002,'开源社区':1983,'隐私保护':1995,'数字货币':2009,'算法治理':2016,'内容推荐':2000,
+  '短视频':2011,'网络直播':2005,'零工经济':2005,'数字身份':2010,'跨境协作':2010,'精确制导武器':1972,'隐身战机':1981,'无人机作战':2001,'网络战':1999,'电磁炮':2010,'激光武器':1960,'高超音速导弹':2019,'太空军事':2019,'AI自主武器':2020,'量子通信':1984,'电子对抗':1940,'蜂群无人机':2015,'定向能武器':1980,'可控核聚变商用':2035,'反物质能源':2200,
+  '零点能提取':2300,'戴森球':2500,'戴森云':2600,'戴森环':2700,'恒星引擎':3000,'黑洞发电':2400,'反物质推进':2250,'正反物质湮灭':2230,'卡西米尔效应能源':2280,'宇宙弦能':2700,'真空衰变能':3000,'霍金辐射能':2500,'引力能':2400,'时空曲率能':2600,'奇点能':2800,'虫洞能':2900,'星际能源网':2400,'反物质存储':2260,'反物质工厂':2280,'核聚变火箭':2050,
+  '聚变推进器':2060,'冷核聚变':2100,'气泡聚变':2150,'惯性约束聚变':2050,'磁约束聚变':2040,'仿星器商用':2040,'托卡马克商用':2035,'等离子体推进':2050,'太阳帆推进':2060,'激光帆推进':2080,'磁帆':2100,'电帆':2070,'核脉冲推进':2080,'代达罗斯计划':2200,'巴萨德冲压引擎':2300,'聚变冲压引擎':2250,'反物质冲压引擎':2280,'戴森球建造':2400,'星球工程':2200,'恒星级工程':2700,
+  '星系级工程':3200,'宇宙级工程':4000,'奇点反应堆':2600,'可编程物质':2150,'中子星物质':2600,'夸克物质':2700,'奇异物质':2800,'超固态':2300,'金属氢':2200,'超流体':2100,'玻色-爱因斯坦凝聚':2080,'拓扑材料':2050,'时间晶体':2100,'负质量物质':2700,'维度折叠材料':2900,'超维度材料':3000,'光子晶体':2080,'磁单极子材料':2600,'通用人工智能':2040,'超级智能':2050,
+  '人工意识':2100,'意识上传':2150,'数字永生':2200,'全脑仿真':2120,'量子互联网':2035,'量子计算机商用':2030,'光子计算机':2040,'DNA计算机':2040,'生物计算机':2050,'神经形态计算':2040,'类脑芯片':2040,'量子机器学习':2045,'量子霸权':2019,'量子纠错':2030,'拓扑量子计算':2040,'脑脑接口':2080,'集体智能':2100,'蜂群智能':2060,'超级智能体':2050,'自主智能体':2045,
+  '递归自我改进':2060,'智能爆炸':2070,'技术奇点':2070,'强人工智能':2040,'世界模型':2050,'具身智能':2045,'永生技术':2100,'抗衰老':2030,'纳米医学':2040,'纳米机器人':2040,'基因修复':2035,'基因增强':2060,'人类增强':2060,'赛博格':2070,'生化人':2080,'器官培育':2035,'克隆人':2040,'人造子宫':2040,'合成生命':2035,'人工细胞':2030,
+  '异种移植':2040,'脑机融合':2045,'神经接口':2040,'感官增强':2060,'义眼义肢':2040,'仿生器官':2040,'血液替代':2040,'冷冻休眠':2100,'人体冷冻':2025,'意识转移':2200,'意识备份':2180,'数字副本':2160,'上传意识':2150,'设计婴儿':2040,'定制人类':2060,'超人主义':2060,'后人类':2080,'跨人类':2070,'曲速引擎':2400,'阿库别瑞引擎':2400,
+  '虫洞':2500,'可穿越虫洞':2700,'克尔黑洞':2600,'白洞':2700,'时空折叠':2600,'超空间':2700,'跃迁引擎':2500,'超光速通信':2300,'中微子通信':2200,'引力波通信':2250,'反重力':2300,'反重力飞行器':2350,'悬浮城市':2400,'轨道电梯':2200,'太空电梯':2200,'天钩':2150,'轨道环':2500,'星际飞船':2300,'世代飞船':2400,'殖民飞船':2350,
+  '冬眠舱':2100,'曲速星舰':2500,'方舟飞船':2300,'诺亚方舟':2300,'戴森球飞船':2600,'冯诺依曼探测器':2400,'自我复制飞船':2450,'星际方舟':2400,'恒星飞船':2500,'聚变飞船':2250,'反物质飞船':2280,'核脉冲飞船':2200,'激光帆飞船':2250,'微波帆飞船':2260,'磁帆飞船':2250,'曲速飞船':2500,'虫洞飞船':2600,'超空间飞船':2700,'时间飞船':2800,'时空飞船':2900,
+  '量子传送':2400,'物质传送':2500,'瞬间移动':2600,'空间跳跃':2500,'星际跳跃':2600,'银河高速':2700,'星际航线':2400,'星际港口':2500,'太空城':2200,'奥尼尔圆柱':2200,'斯坦福圆环':2200,'伯纳尔球':2200,'行星改造':2300,'火星地球化':2400,'金星地球化':2500,'月球殖民':2100,'小行星采矿':2150,'彗星采矿':2200,'星际采矿':2400,'木星采矿':2400,
+  '土星环采矿':2500,'戴森球采矿':2600,'奥尔特云文明':2700,'星际游牧':2400,'星际文明':2200,'卡尔达肖夫指数':2100,'II型文明':2500,'III型文明':3000,'后稀缺社会':2100,'后劳动社会':2120,'全民基本收入':2050,'星际联邦':2400,'银河帝国':3000,'跨星际外交':2400,'通用翻译':2100,'通用语言':2150,'星际法律':2400,'星际贸易':2300,'星际货币':2300,'数字永生社会':2200,
+  '虚拟世界居民':2150,'多重身份':2120,'集体意识':2300,'群体智能社会':2200,'自动化政府':2100,'AI治理':2060,'算法民主':2080,'直接民主':2050,'流动性民主':2070,'共识决策':2080,'预测市场':2050,'通用基本服务':2060,'资源导向经济':2200,'礼物经济':2100,'后资本主义':2150,'后社会主义':2200,'星际共产主义':2400,'星际乌托邦':2500,'戴森球文明':2600,'银河文明':3000,
+  '宇宙文明':3500,'第一接触':2400,'外星文明':2400,'外星生命':2300,'费米悖论解答':2500,'大过滤器':2400,'黑暗森林':2400,'猎人假设':2400,'动物园假设':2400,'外星遗迹':2500,'外星科技':2500,'逆向工程':2400,'跨维度文明':3000,'时间旅行社会':2800,'多元宇宙':2900,'平行宇宙':2900,'量子多元宇宙':2900,'模拟假说':2500,'模拟宇宙':2800,'缸中之脑':2400,
+  '玻尔兹曼大脑':2600,'意识上传社会':2200,'数字来世':2200,'数字天堂':2250,'虚拟伊甸园':2300,'超人类伦理':2100,'后人类伦理':2200,'机器伦理':2080,'AI权利':2100,'合成生命权利':2150,'引力武器':2400,'黑洞炸弹':2600,'反物质弹':2300,'维度武器':2700,'时间武器':2800,'因果武器':2900,'概率武器':2500,'量子武器':2400,'纳米武器':2100,'灰蛊':2200,
+  '自我复制武器':2300,'冯诺依曼机器武器':2350,'智能武器':2100,'自主武器':2100,'蜂群武器':2150,'星舰武器':2400,'行星毁灭':2600,'恒星毁灭':2800,'星系毁灭':3200,'宇宙毁灭':3500,'维度撕裂':2800,'现实扭曲':2800,'现实工程':2900,'时空武器':2700,'时间旅行武器':2800,'祖父悖论武器':2900,'超光速导弹':2400,'曲速鱼雷':2450,'量子纠缠武器':2400,'意识武器':2300,
+  '纳米病毒':2200,'基因武器':2100,'合成生物武器':2150,'AI病毒':2100,'量子病毒':2400,'计算机病毒终极版':2200,'赛博武器':2100,'网络空间武器':2100,'信息武器':2100,'模因武器':2200,'认知武器':2200,'心理武器':2150,'社会工程武器':2100,'经济武器':2100,'货币武器':2150,'贸易武器':2150,'资源武器':2200,'能量武器':2300,'反能量武器':2400,'零点能武器':2500,
+  '真空衰变弹':2800,'奇异夸克弹':2700,'磁单极子武器':2600,'暗物质武器':2700,'暗能量武器':2800,'弦武器':2900,'膜武器':3000,'高维武器':3000,'维度封锁':2800,'维度打击':2850,'时空封锁':2900,'因果封锁':2900,'现实锁定':2950,'命运武器':3000,'运气武器':3000,'概率操纵武器':2900,'量子自杀武器':3000,'量子永生武器':3000,'全息武器':2600,'模拟武器':2800,
+};
+/* ============================================================
+   【九层球壳半径】RADII[i] ~ RADII[i+1] 之间是第 i 个时代的空间范围。
+   整体调大=星云更空旷、视角要拉得更远；
+   相邻值差距越大，该时代占据的空间越厚。
+   最后一个 1000 是未来时代的边界，也参与相机距离计算
+   ============================================================ */
+const RADII = [0, 24, 38, 57, 84, 123, 180, 262, 375, 1000];
+/* 【构建全部科技节点】每个科技计算三件事：
+   1. appear = 时代序号 + 时代内进度（决定它在时间轴第几秒出现）
+   2. pos    = 在该时代球壳内的随机球面位置
+   3. baseSize/自转轴/抖动相位等视觉随机量
+   球壳内的分布是完全随机的，所以转动视角不会看到固定的排列规律 */
+const NODES = [];
+ERA_DEFS.forEach((def, ei) => {
+  const flat = interleave(def.g, 9781 + ei * 137);
+  const n = flat.length;
+  const eraSpan = def.y1 - def.y0;
+  const r0 = RADII[ei], r1 = RADII[ei + 1];
+  const items = flat.map((tech, i) => {
+    const knownYear = KNOWN_YEARS[tech.name];
+    let p, hasYear = false;
+    if(typeof knownYear === 'number'){
+      p = (knownYear - def.y0) / eraSpan;
+      p = Math.min(0.985, Math.max(0.015, p));
+      hasYear = true;
+    } else {
+      p = -1;
+    }
+    return { tech, i, knownYear, p, hasYear };
+  });
+  const unknown = items.filter(it => !it.hasYear);
+  unknown.sort((a, b) => a.i - b.i);
+  unknown.forEach((it, k) => {
+    it.p = 0.01 + ((k + 0.5) / Math.max(1, unknown.length)) * 0.98;
+  });
+  items.forEach(it => { if(it.p < 0) it.p = 0.5; });
+  items.forEach((it, idx) => {
+    const p = it.p;
+    let r;
+    if(ei === 0){
+      r = (r0 + (r1 - r0) * (0.15 + 0.85 * Math.pow(p, 0.92))) * (0.9 + Math.random() * 0.2);
+    } else {
+      r = r0 + (r1 - r0) * (0.15 + 0.85 * Math.random());
+    }
+    const y = 1 - 2 * Math.random();
+    const rad = Math.sqrt(Math.max(0, 1 - y * y));
+    const theta = Math.random() * Math.PI * 2;
+    const dir = new THREE.Vector3(
+      Math.cos(theta) * rad,
+      y,
+      Math.sin(theta) * rad
+    ).normalize();
+    const rr = Math.random();
+    const distFactor = 1.25 - Math.min(1, r / RADII[8]) * 0.5;
+    const spinSpeed = (0.08 + rr * rr * 1.8) * distFactor * (Math.random() < 0.5 ? -1 : 1);
+    let ax = Math.random() * 2 - 1, ay = Math.random() * 2 - 1, az = Math.random() * 2 - 1;
+    const aLen = Math.hypot(ax, ay, az) || 1;
+    const spinAxis = { x: ax / aLen, y: ay / aLen, z: az / aLen };
+        /* 【NODES 每个节点的字段含义】
+         name         科技名。必须与 KNOWN_YEARS、MAJOR_NAMES 里的写法完全一致，
+                      否则年份或"重大成就"标记会**静默失效**，排查时很难发现
+         cat          门类 key（对应 CATS）
+         color/colorCss  门类配色的 THREE.Color 与 CSS 字符串
+         pos          在该时代球壳内的三维位置（球面均匀随机）
+         era          时代序号 0~8
+         appear       出现时刻 = era + 时代内进度，时间轴超过它才解锁
+         timeProgress 时代内进度 0~1（由真实年份或顺序均分得来）
+         hasKnownYear 是否有真实年份（详情面板据此决定是否标注"约"）
+         baseSize     星球基础尺寸（重大成就会再 ×1.45）
+         phase/freq   抖动相位与频率（每个点不同，避免整齐划一）
+         spinSpeed    开启"轨道旋转"后绕自身轴的转速（正负号 = 方向）
+         spinAxis     自转的随机单位向量轴
+       注：早期版本还有 ringR/ringW（光点外围光环），星球着色器改版后已废弃 */
+    NODES.push({
+      name: it.tech.name,
+      cat: it.tech.cat,
+      color: CAT_COLOR[it.tech.cat],
+      colorCss: CATS.find(c => c.key === it.tech.cat).color,
+      pos: dir.multiplyScalar(r),
+      era: ei,
+      appear: ei + p,
+      timeProgress: p,
+      hasKnownYear: it.hasYear,
+      baseSize: 0.60 + r * 0.020,
+      phase: Math.random() * Math.PI * 2,
+      freq: 0.35 + Math.random() * 0.85,
+      spinSpeed,
+      spinAxis,
+    });
+  });
+});
+const TOTAL_TECHS = NODES.length;
+console.log('科技总数:', TOTAL_TECHS);
+/* ============================================================
+   【每个时代内，单个科技出现的间隔秒数】
+   数值越大 = 该时代播放越慢、总时长越长。
+   九个数值依次对应九大时代——越靠后的时代数值越小，
+   因为后期科技条目更多，用更短的间隔来平衡总时长。
+   配合界面上的倍速按钮（0.5x~5x）一起决定整体播放速度
+   ============================================================ */
+const ERA_INTERVAL = [0.090, 0.073, 0.062, 0.050, 0.043, 0.036, 0.030, 0.025, 0.018];
+const eraCounts = new Array(ERA_DEFS.length).fill(0);
+NODES.forEach(n => eraCounts[n.era]++);
+const eraDur = ERA_DEFS.map((_, ei) => eraCounts[ei] * ERA_INTERVAL[ei]);
+console.log('各时代科技数:', eraCounts.join(' / '));
+console.log('各时代时长(s):', eraDur.map(d => d.toFixed(1)).join(' / '));
+/* 【重大成就名单】出现在这里的科技会被标记为"重大成就"：
+   光点更大（×1.45）且标签常驻显示。名字必须与 ERA_DEFS 完全一致 */
+const MAJOR_NAMES = new Set(s('火的使用|钻木取火|打制石器|磨制石器|陶器烧制|弓与箭|结绳记事|洞穴壁画|原始语言|草药认知|犬的驯化|植物驯化|部落氏族|以物易物|灌溉渠|青铜合金|织布机|楔形文字|甲骨文|算盘|十进制计数|太阳历|莎草纸|小麦栽培|水稻栽培|马的驯化|酿酒|轮子|马车|帆船|运河|城市聚落|法典|货币|金字塔|学校|青铜剑|城墙|罗马混凝土|高炉|铸铁|欧几里得几何|地心说模型|星盘|羊皮纸|勾股定理|圆周率计算|杠杆原理|齿轮传动|解剖学|外科手术器械|公共卫生下水道|罗马大道|灯塔|船舵|司南|罗马法|儒学|丝绸之路|科举萌芽|弩炮|罗马军团方阵|希腊火|风车磨坊|煤炭开采|火药配方|眼镜|蒸馏器|机械钟|纺车|马镫|造纸|活字印刷|阿拉伯数字|代数学|大学|指南针|航海图|复式记账|银行|医院|人痘接种|磁罗盘|三桅帆船|四轮马车|火药武器|火炮|火绳枪|城堡|长弓|蒸汽泵|望远镜|显微镜|摆钟|印刷机|日心说|开普勒定律|牛顿力学|微积分|对数|解析几何|科学方法|百科全书|报纸|温度计|气压计|万有引力|血液循环|人体解剖|接种法|六分仪|热气球雏形|文艺复兴|宗教改革|专利制度|股份公司|启蒙思想|公共教育|科学院|蒸汽机|瓦特蒸汽机|铁路|蒸汽船|螺旋桨|电报|摩尔斯电码|电话|摄影术|留声机|牛痘疫苗|乙醚麻醉|消毒法|细菌学|听诊器|输血|公共卫生|护理学|贝塞麦炼钢|平炉炼钢|波特兰水泥|橡胶硫化|合成染料|安全火柴|铝冶炼|钢筋混凝土|工厂制|工会|义务教育|马克思主义|日报|警察制度|后装步枪|机枪|铁甲舰|鱼雷|铁丝网|发电机|电动机|白炽灯|交流电|内燃机|柴油机|喷气发动机|核裂变|核电站|太阳能电池|燃料电池|合金钢|不锈钢|尼龙|聚乙烯|半导体硅|晶体管|集成电路|电子计算机|图灵机|编程语言|操作系统|ARPANET|卫星通信|激光|光纤|雷达|电视|微处理器|个人电脑|C语言|图形界面|X光|心电图|胰岛素|青霉素|抗生素|DNA双螺旋|心脏起搏器|器官移植|汽车量产|飞机|直升机|喷气客机|火箭|人造卫星|载人航天|阿波罗登月|高铁|核潜艇|联合国|人权宣言|广播|信用卡|环保运动|绿色革命|坦克|航空母舰|导弹|原子弹|氢弹|喷气战斗机|电子战|弹道导弹|光伏发电|风力发电|锂离子电池|核聚变实验|智能电网|氢能|碳纳米管|石墨烯|3D打印|超材料|高温超导|量子点|互联网|万维网|搜索引擎|电子邮件|智能手机|WiFi|GPS|云计算|大数据|人工智能|深度学习|GPU计算|量子计算|区块链|加密货币|虚拟现实|增强现实|元宇宙|大语言模型|物联网|5G|自动驾驶|计算机视觉|语音识别|开源软件|Linux|Python|数字孪生|扩散模型|多模态模型|智能体|基因工程|PCR技术|DNA测序|人类基因组计划|克隆技术|干细胞|CRISPR基因编辑|mRNA疫苗|免疫疗法|靶向药物|机器人手术|脑机接口|合成生物学|CAR-T疗法|远程医疗|基因治疗|可回收火箭|国际空间站|火星车|深空探测器|电动车|自动驾驶汽车|超级高铁|无人机配送|可重复使用飞船|月球基地|太空旅游|卫星互联网|离子推进器|社交媒体|电子商务|共享经济|远程办公|数字支付|在线教育|数字货币|内容推荐|短视频|零工经济|数字身份|精确制导武器|隐身战机|无人机作战|网络战|激光武器|高超音速导弹|量子通信|微信|微信支付|抖音|哔哩哔哩|快手|Google|YouTube|TikTok|美团|淘宝|支付宝|京东|拼多多|小红书|微博|知乎|豆瓣|百度|高德地图|网易云音乐|QQ音乐|Spotify|Netflix|Discord|Telegram|WhatsApp|Instagram|Facebook|ChatGPT|Midjourney|Stable Diffusion|Figma|Zoom|钉钉|飞书|GitHub|Docker|Kubernetes|AWS|阿里云|TensorFlow|PyTorch|我的世界|王者荣耀|原神|英雄联盟|Dota2|绝地求生|塞尔达传说|艾尔登法环|GTA|使命召唤|魔兽世界|星际争霸|Steam|Epic Games|PlayStation|Roblox|堡垒之夜|和平精英|守望先锋|Valorant|可控核聚变商用|反物质能源|零点能提取|戴森球|戴森云|戴森环|量子真空能|微型黑洞能|恒星引擎|黑洞发电|反物质推进|正反物质湮灭|卡西米尔效应能源|宇宙弦能|真空衰变能|质子衰变能|霍金辐射能|引力能|时空曲率能|奇点能|虫洞能|星际能源网|反物质存储|反物质工厂|核聚变火箭|聚变推进器|μ子催化聚变|冷核聚变|气泡聚变|惯性约束聚变|磁约束聚变|仿星器商用|托卡马克商用|等离子体推进|磁等离子体推进|VASIMR推进|太阳帆推进|激光帆推进|磁帆|电帆|核脉冲推进|代达罗斯计划|巴萨德冲压引擎|聚变冲压引擎|反物质冲压引擎|戴森球建造|星球工程|恒星级工程|星系级工程|宇宙级工程|奇点反应堆|可编程物质|中子星物质|夸克物质|奇异物质|超固态|金属氢|超流体|玻色-爱因斯坦凝聚|拓扑材料|时间晶体|负质量物质|负能量密度材料|维度折叠材料|超维度材料|光子晶体|磁单极子材料|通用人工智能|超级智能|人工意识|意识上传|数字永生|全脑仿真|量子互联网|量子计算机商用|光子计算机|DNA计算机|生物计算机|神经形态计算|类脑芯片|量子机器学习|量子霸权|量子优势|量子纠错|拓扑量子计算|脑脑接口|集体智能|超级智能体|自主智能体|递归自我改进|智能爆炸|技术奇点|强人工智能|世界模型|具身智能|多模态超级智能|永生技术|抗衰老|纳米医学|纳米机器人|基因修复|基因增强|人类增强|赛博格|生化人|器官培育|克隆人|人造子宫|合成生命|人工细胞|异种移植|脑机融合|神经接口|感官增强|义眼义肢|仿生器官|血液替代|冷冻休眠|人体冷冻|意识转移|意识备份|数字副本|上传意识|设计婴儿|定制人类|超人主义|后人类|跨人类|曲速引擎|阿库别瑞引擎|虫洞|可穿越虫洞|克尔黑洞|白洞|时空折叠|超空间|跃迁引擎|超光速通信|反重力|反重力飞行器|悬浮城市|轨道电梯|太空电梯|天钩|轨道环|星际飞船|世代飞船|殖民飞船|冬眠舱|曲速星舰|方舟飞船|诺亚方舟|戴森球飞船|冯诺依曼探测器|自我复制飞船|星际方舟|恒星飞船|聚变飞船|反物质飞船|核脉冲飞船|激光帆飞船|微波帆飞船|磁帆飞船|曲速飞船|虫洞飞船|超空间飞船|时间飞船|时空飞船|量子传送|物质传送|瞬间移动|空间跳跃|星际跳跃|银河高速|星际航线|星际港口|太空城|奥尼尔圆柱|斯坦福圆环|伯纳尔球|行星改造|火星地球化|金星地球化|月球殖民|小行星采矿|彗星采矿|星际采矿|星际文明|卡尔达肖夫指数|II型文明|III型文明|后稀缺社会|后劳动社会|全民基本收入|星际联邦|银河帝国|跨星际外交|通用翻译|星际法律|星际贸易|星际货币|数字永生社会|虚拟世界居民|多重身份|集体意识|蜂群思维|群体智能社会|自动化政府|AI治理|算法民主|流动性民主|共识决策|预测市场|通用基本服务|资源导向经济|礼物经济|共享经济2.0|后资本主义|后社会主义|星际共产主义|星际乌托邦|戴森球文明|银河文明|宇宙文明|第一接触|外星文明|外星生命|费米悖论解答|大过滤器|黑暗森林|猎人假设|动物园假设|外星遗迹|外星科技|逆向工程|跨维度文明|时间旅行社会|多元宇宙|平行宇宙|量子多元宇宙|模拟假说|模拟宇宙|缸中之脑|玻尔兹曼大脑|意识上传社会|数字来世|数字天堂|虚拟伊甸园|超人类伦理|后人类伦理|机器伦理|AI权利|合成生命权利|引力武器|黑洞炸弹|反物质弹|维度武器|时间武器|因果武器|概率武器|量子武器|纳米武器|灰蛊|自我复制武器|冯诺依曼机器武器|智能武器|自主武器|蜂群武器|星舰武器|行星毁灭|恒星毁灭|星系毁灭|宇宙毁灭|维度撕裂|现实扭曲|现实工程|时空武器|时间旅行武器|祖父悖论武器|超光速导弹|曲速鱼雷|量子纠缠武器|意识武器|纳米病毒|基因武器|合成生物武器|AI病毒|量子病毒|计算机病毒终极版|赛博武器|网络空间武器|信息武器|模因武器|认知武器|心理武器|社会工程武器|经济武器|货币武器|贸易武器|资源武器|能量武器|反能量武器|零点能武器|真空衰变弹|奇异夸克弹|磁单极子武器|暗物质武器|暗能量武器|弦武器|膜武器|高维武器|维度封锁|维度打击|时空封锁|因果封锁|现实锁定|命运武器|运气武器|概率操纵武器|量子自杀武器|量子永生武器|全息武器|模拟武器'));
+/* 【重大成就配额分配】按各时代科技数量比例分配名额（总数 TARGET=450），
+   优先从 MAJOR_NAMES 里选，不够再用普通科技补齐。
+   改 TARGET 可调整重大成就总数 */
+function pickMajorIndices(){
+  const TOTAL = NODES.length, TARGET = 450, EC = ERA_DEFS.length;
+  const byEra = Array.from({ length: EC }, () => []);
+  NODES.forEach((n, i) => byEra[n.era].push(i));
+  const quotas = byEra.map(arr => Math.max(2, Math.round(arr.length / TOTAL * TARGET)));
+  let sum = quotas.reduce((a, b) => a + b, 0), guard = 0, idx = 0;
+  while(sum > TARGET && guard++ < 2000){ if(quotas[idx % EC] > 2){ quotas[idx % EC]--; sum--; } idx++; }
+  guard = 0;
+  while(sum < TARGET && guard++ < 4000){ quotas[idx % EC]++; sum++; idx++; }
+  const result = [];
+  for(let e = 0; e < EC; e++){
+    const all = byEra[e];
+    const kw = all.filter(i => MAJOR_NAMES.has(NODES[i].name));
+    const rest = all.filter(i => !MAJOR_NAMES.has(NODES[i].name));
+    const q = quotas[e], picked = [];
+    if(kw.length >= q){
+      const step = kw.length / q;
+      for(let k = 0; k < q; k++) picked.push(kw[Math.floor(k * step)]);
+    } else {
+      picked.push(...kw);
+      const need = q - kw.length;
+      if(need > 0 && rest.length > 0){
+        const step = rest.length / need;
+        for(let k = 0; k < need; k++) picked.push(rest[Math.floor(k * step)]);
+      }
+    }
+    result.push(...picked);
+  }
+  return result;
+}
+const MAJOR_INDICES = pickMajorIndices();
+const MAJOR_SET = new Set(MAJOR_INDICES);
+MAJOR_INDICES.forEach(i => { NODES[i].baseSize *= 1.45; NODES[i].isMajor = true; });
+/* ============================================================
+   【关键词精准描述】格式为 "关键词1,关键词2~描述"，用 ~ 分隔描述。
+   点开科技时优先匹配这里——命中则用它（语义准确），
+   未命中才回退到下面的组合式句干。
+   新增一条：在引号内按 "词1,词2~你的描述|" 追加即可
+   ============================================================ */
+const KEYWORD_DESCS = (
+'受控核聚变,可控核聚变,冷核聚变,气泡聚变,惯性约束聚变,磁约束聚变,仿星器,托卡马克,球形托卡马克,场反位形~让轻原子核在极高温高压下融合，模拟太阳内部的反应。燃料取之不尽，且不会产生长寿命放射性废物——这是人类对终极清洁能源的追求。|核裂变,核电站,核反应堆,压水堆,沸水堆,快中子堆,钍基熔盐堆~重原子核被中子分裂时释放巨大能量，人类第一次掌握了可以撼动地质年代尺度的力量。|戴森球,戴森云,戴森环~围绕恒星构建的巨型能量采集结构，代表着一个文明对母恒星能量的完全掌控。|反物质,正反物质湮灭,反物质推进,反物质工厂,反物质存储~当物质与反物质相遇时，质量会100%转化为能量，是已知宇宙中最极致的能量转换方式。|卡西米尔,零点能,真空能,真空极化,虚粒子~量子力学预言真空中存在不断的能量涨落，提取这些"零点能"意味着可以从虚无本身获取能量。|宇宙弦,真空衰变,霍金辐射,奇点能,时空曲率能,引力能~宇宙尺度的能量现象，其能量密度远超人类可以在实验室中制造的任何反应。|' +
+'光伏,太阳能电池,晶硅光伏,薄膜光伏,有机光伏,聚光太阳能,钙钛矿电池,钙钛矿太阳能~直接将阳光转化为电能，让每一寸被太阳照亮的土地都成为潜在的发电厂。|风力发电,陆上风电,海上风电,高空风电,垂直轴风机~捕捉大气的流动，将自然界的风转化为可用的电力。|水力发电,水电站,潮汐发电,波浪能,海洋能,地热能,地热发电~利用自然界的水位落差、潮汐涨落或地热梯度来发电，是一种稳定的清洁能源。|锂离子电池,钠离子电池,固态电池,磷酸铁锂,三元锂,液流电池~将电能以化学形式存储起来，让移动设备和电动车摆脱了线缆的束缚。|燃料电池,质子交换膜,固体氧化物~通过电化学反应直接发电，效率远超传统燃烧，唯一的排放是水。|氢能,绿氢,蓝氢,电解水制氢,储氢材料,加氢站~氢是宇宙中最丰富的元素，燃烧后只生成水——是理想的清洁能源载体。|' +
+'智能电网,虚拟电厂,微电网,需求响应,能源互联网,分布式能源~让电力生产与消费实时平衡的智能调度网络，让不稳定的可再生能源也能稳定接入。|储能,抽水蓄能,压缩空气储能,飞轮储能,超导磁储能~将多余的电能暂时储存起来，在需要时释放——是电网稳定的关键。|蒸汽机,瓦特,纽科门,双作用蒸汽~第一次让人类把热能高效转化为机械运动，直接催生了工业革命。|内燃机,柴油机,汽油机,煤气机~燃料在气缸内直接燃烧推动活塞，为交通工具提供了强劲而便携的动力。|喷气,涡扇,涡喷,燃气轮机,蒸汽轮机~高速气流或蒸汽推动叶片旋转，为飞机和发电厂提供澎湃动力。|火箭,推进器,离子推进,霍尔推进,VASIMR,太阳帆,光帆,磁帆,电帆,核脉冲,巴萨德,冲压引擎,代达罗斯,猎户座~通过向后高速喷射物质或利用外部能量获得推力，是人类进入太空唯一可行的方式。|' +
+'发电机,电动机,感应电动机~电与机械能之间的双向转换装置，支撑着整个现代工业社会运转。|超导,钇钡铜氧,铁基超导~在低温下电阻突然消失，电流可以无损耗地流动——是能源与磁体技术的关键。|锅炉,燃烧,火力发电,燃煤,燃气电厂,燃油电厂~通过燃烧化石燃料加热水产生蒸汽，推动轮机发电。|输电网,高压输电,超高压输电,变压器,无线充电,无线输电,微波输电~让电能可以高效地在长距离或短距离中传输和分配。|石墨烯,碳纳米管,碳纤维,碳气凝胶,石墨炔,氧化石墨烯~由碳原子构成的纳米级结构，强度是钢的数百倍，而重量却极轻。|纳米,纳米管,纳米线,纳米薄膜,纳米颗粒~在原子和分子尺度上操控物质，让材料性能突破宏观世界的限制。|' +
+'半导体,单晶硅,多晶硅,非晶硅,锗半导体,砷化镓,氮化镓,碳化硅,宽禁带半导体,第三代半导体~导电性介于导体与绝缘体之间的材料，是整个信息时代的物理基础。|超导材料,低温超导,高温超导~零电阻的材料，可以让电流永不衰减，也让磁悬浮成为现实。|金属玻璃,非晶合金,液态金属,镓基液态金属~原子排列无序的金属，兼具金属的强度与玻璃的弹性。|3D打印,4D打印,增材制造,光固化打印,熔融沉积,选择性激光烧结,电子束熔化~逐层堆叠材料构建三维物体，让复杂结构的设计与制造不再受传统工艺限制。|超材料,负折射率,声学超材料,力学超材料,隐身超材料~人工设计的结构让材料展现出自然界中不存在的属性，例如隐身或负折射。|钙钛矿,MXene,二维材料,二硫化钼,黑磷,六方氮化硼~新型低维或晶体结构材料，在光伏、电子和能源领域展现出惊人的潜力。|' +
+'生物可降解,聚乳酸,聚羟基脂肪酸酯~使用后可被微生物分解的塑料，缓解了传统塑料带来的环境问题。|气凝胶,硅气凝胶~99%以上都是空气的固体，是目前已知最轻的固体材料之一，同时是最好的隔热材料。|自修复,自愈合~能够自动修复裂纹或损伤的智能材料，模仿了生物体的自愈能力。|水泥,混凝土,砂浆,波特兰水泥,罗马混凝土,钢筋混凝土,预应力混凝土~将碎石、砂与水硬性胶凝材料结合，塑造了现代城市的天际线。|钢铁,炼钢,高炉,坩埚钢,合金钢,贝塞麦,平炉炼钢,不锈钢,工具钢,高速钢~铁与碳的合金，通过控制碳含量和添加元素，可以调节硬度、韧性与耐腐蚀性。|青铜,铜合金,黄铜,白铜,铜冶炼~铜与锡或锌的合金，比纯铜更坚硬耐用，是人类最早掌握的合金之一。|' +
+'玻璃,琉璃,珐琅,吹制玻璃,平板玻璃,光学玻璃,石英玻璃~熔融后冷却成型的非晶态固体，透明而坚硬，从窗户到光纤无处不在。|陶瓷,陶器,陶轮,瓷,耐火砖~经高温烧结的无机非金属材料，人类最古老也最持久的人造材料之一。|橡胶,轮胎,橡胶硫化~弹性极佳的高分子材料，让车轮可以平稳地滚动在崎岖的地面上。|塑料,聚乙烯,尼龙,聚碳酸酯,特氟龙,酚醛树脂,环氧树脂,聚丙烯,聚氯乙烯,聚苯乙烯~人工合成的高分子材料，可塑性强、成本低廉，深刻改变了日常生活的每一个角落。|合金,钛合金,镁合金,铝合金,形状记忆合金~将不同金属熔合，兼顾强度、轻量与耐腐蚀性。|染料,颜料,合成染料,普鲁士蓝,茜素,靛蓝,群青~让世界变得多彩的化学物质，从纺织到绘画都离不开它们。|' +
+'纺织,纺车,织布机,丝绸,天鹅绒,毛呢,亚麻,印染~将纤维编织成布料的工艺，支撑了人类数千年的衣着与文明。|皮革,鞣革,毛毡~将动物皮毛加工成耐用材料的古老工艺。|焊,铸造,锻造,淬火,回火,退火,渗碳~金属加工的核心工艺，通过加热、冷却或形变来改变金属的性能。|光学玻璃,透镜,镜片~经过精密加工的高纯度玻璃，是望远镜、显微镜和相机镜头的核心。|量子计算机,量子计算,量子霸权,量子优势,量子纠错,拓扑量子计算,任意子量子计算,马约拉纳量子比特,量子机器学习~利用量子叠加和纠缠进行计算，在特定问题上远超经典计算机的能力。|人工智能,深度学习,机器学习,神经网络,强化学习,迁移学习,自监督学习,联邦学习,世界模型,具身智能~让机器从数据中学习规律并做出决策，正在深刻改变人类社会的运转方式。|' +
+'大语言模型,ChatGPT,Claude,Copilot,多模态模型,多模态大模型,视觉语言模型,扩散模型,Midjourney,Stable Diffusion,AI绘画,AI写作,AI编程助手,代码自动补全,端侧AI,智能体~在海量数据上训练出的神经网络，能够理解与生成自然语言、图像甚至代码，让人机交互进入新的阶段。|互联网,万维网,网络,ARPANET,局域网,广域网,点对点网络,星际互联网~互联的计算机网络让信息的传播突破了地理与时间的限制。|搜索引擎,Google,百度~从海量信息中快速检索出最相关的结果，成为信息时代的基础设施。|智能手机,手机~把计算机、通信、相机与传感器集于掌心，成为现代人最贴身的数字伴侣。|5G,6G,4G,3G,2G,1G,WiFi,蓝牙,无线通信~无线通信技术的代际跃迁，让数据传输速率与延迟不断突破极限。|GPS,北斗,导航,卫星导航~通过卫星定位，让地球上的任何位置都能被精确测量。|' +
+'量子密钥,量子通信,后量子密码,量子隐形传态,量子纠缠通信~利用量子力学原理实现理论上无法被窃听的保密通信。|区块链,比特币,以太坊,加密货币,稳定币,央行数字货币,NFT,Web3,DAO,去中心化身份,智能合约~去中心化的分布式账本，让价值交换不再依赖中心机构的信任。|虚拟现实,增强现实,VR,AR,元宇宙,全息投影,全息存在~沉浸式的数字体验，模糊了物理世界与虚拟世界之间的边界。|脑机,神经接口,脑机融合,脑联网,神经互联网,意识互联网,脑波输入,意念控制,脑脑接口~在大脑与外部设备之间建立直接的通信通路，让意念可以直接操控机器。|云计算,AWS,阿里云,Azure,腾讯云,华为云,边缘计算,雾计算~按需获取计算资源，把IT基础设施变成像水电一样的基础服务。|微处理器,CPU,芯片,集成电路,晶体管,半导体工艺,光刻,GPU~把数以亿计的晶体管集成到指甲盖大小的硅片上。|' +
+'操作系统,Linux,Windows,Unix,macOS,DOS~管理计算机硬件与软件资源的系统软件，是应用运行的基础平台。|编程语言,Python,C语言,Java,JavaScript,C++,编译器,解释器~人与计算机交流的形式化语言，让复杂的计算可以被精确表达。|数据库,MySQL,MongoDB,PostgreSQL,SQL,NoSQL,向量数据库~结构化的数据存储与检索系统，是现代应用的核心组件。|容器,Docker,Kubernetes,微服务,容器技术,服务网格,DevOps~把应用和依赖打包在一起，让软件可以在任何环境中一致地运行。|开源,Linux,开源软件,开源社区,GitHub,GitLab~源代码公开、任何人都可以使用和修改的软件，是当代软件生态的基石。|数字孪生,数字孪生城市,智慧城市,智能交通,车路协同~用数字模型实时映射现实世界，让城市和工业系统可以更智能地运行。|' +
+'雷达,声呐,相控阵,卫星通信,微波通信,短波通信~通过发射与接收电磁波或声波来探测、定位与通信。|光纤,激光,光通信~用光来传递信息，速度与带宽都远超传统电缆。|电视,广播,收音机,有线电视,卫星电视,流媒体~把新闻、娱乐和信息实时送达千家万户。|计算机视觉,语音识别,自然语言处理,图像识别,模式识别~让机器能"看"和"听"，理解人类的感知世界。|社交媒体,微博,微信,Facebook,Twitter,Instagram,短视频,抖音,快手,TikTok~让每个人都可以成为信息发布者与连接节点。|疫苗,免疫,抗体,mRNA疫苗,DNA疫苗,病毒载体疫苗,腺病毒疫苗,多价疫苗,卡介苗~通过训练免疫系统来预防或治疗疾病，是现代医学最有力的武器之一。|' +
+'基因,DNA,CRISPR,基因组,基因编辑,碱基编辑,先导编辑,表观遗传~读取、编辑与合成生命的底层编码，人类开始主动塑造生物的演化方向。|干细胞,细胞重编程,类器官,诱导多能干细胞,胚胎干细胞,成体干细胞~未分化的细胞可以分化成各种组织，是再生医学的核心。|抗生素,青霉素,链霉素,四环素,氯霉素,磺胺~抑制或杀灭细菌的药物，把无数曾经致命的感染变成了可控的疾病。|X光,CT,核磁,B超,超声,内窥镜,胃镜,腹腔镜,影像~无损地看到身体内部的图像，让医生能够在不开刀的情况下做出诊断。|心脏起搏器,人工心脏,人工关节,人工晶体,人工耳蜗,仿生器官,义眼义肢~用工程手段替代或辅助受损的人体器官。|器官移植,肾移植,肝移植,心脏移植,骨髓移植,异种移植,异种器官~将健康的器官移植到患者体内，是20世纪外科医学的巅峰成就之一。|' +
+'克隆,克隆技术,克隆人~通过体细胞核移植产生遗传上完全相同的个体。|纳米医学,纳米机器人,纳米医生,纳米医疗~在分子尺度上诊断与治疗疾病，让医学进入前所未有的精度。|永生,抗衰老,端粒,NAD,雷帕霉素,二甲双胍~延缓或逆转衰老过程，让人类的寿命可以远超自然的极限。|意识上传,数字永生,全脑仿真,意识转移,意识备份,人格备份~把人的意识或大脑活动转化为数字信息，让思想可以在计算机中延续。|人工子宫,人造子宫,体外配子,人造精子,人造卵子~在体外孕育生命，让生育不再依赖母体。|脑机接口,侵入式脑机,非侵入式脑机,神经假体~直接连接神经系统与电子设备，让瘫痪患者可以重新控制肢体。|' +
+'靶向药物,免疫疗法,CAR-T,单克隆抗体,PD-1,TCR-T,NK细胞~精确识别并攻击病变细胞，而对正常细胞影响较小的新型药物。|机器人手术,微创手术,达芬奇,远程医疗~让外科医生可以更精确、更微创地进行手术。|测序,基因组计划,单细胞测序,千人基因组,个人基因组~读取生物体完整的DNA序列，为精准医疗和生命科学研究奠定基础。|麻醉,乙醚,氯仿,可卡因~让外科手术可以在患者无痛的状态下进行。|消毒,石炭酸,无菌,高温消毒,公共卫生~通过杀灭病原体来预防感染，是现代医学最基础的进步之一。|解剖,人体解剖,生理,病理,组织学~研究生物体的结构与功能，为医学奠定科学基础。|' +
+'火箭,运载,猎鹰,星舰,可回收火箭,可重复使用飞船~把人类送入太空的运载工具，如今已可以多次重复使用。|铁路,蒸汽机车,高铁,火车,复兴号,新干线,TGV,ICE,磁悬浮,真空管道,超级高铁~在固定的轨道上运行，实现了大规模、高效率的陆地运输。|汽车,福特,特斯拉,电动车,比亚迪,电动汽车,混合动力~个人的交通工具，让普通人也可以自由地跨越城市与乡村。|飞机,喷气客机,直升机,莱特,电动飞机,氢能飞机~依靠机翼产生的升力在空气中飞行，把洲际旅行压缩到数小时。|航天,载人航天,阿波罗,空间站,天宫,国际空间站~让人类得以离开地球，进入无垠的太空。|潜艇,核潜艇,深潜,潜水器,水下机器人~在水下长时间航行的舰艇，是海洋深处的隐形力量。|' +
+'帆船,帆,航海,桨,轮船,蒸汽船~借助风力或机械动力在水上航行，是文明交流最早的载体。|运河,船闸,苏伊士,巴拿马~人工开凿的水道，让船只可以跨越陆地的阻隔。|地铁,地下铁道,轻轨,有轨电车,无轨电车~在城市地下或地面运行的大容量轨道交通。|无人机,eVTOL,飞行汽车,城市空中交通~无人驾驶的空中平台，正在重新定义配送、测绘与城市交通。|火星车,深空探测器,月球探测,嫦娥,旅行者~在行星表面或深空执行探测任务的机器人探测器。|卫星,人造卫星,通信卫星,气象卫星,导航卫星,侦察卫星~环绕地球或其他天体运行的航天器。|' +
+'港口,码头,灯塔,船坞,集装箱~让船舶可以安全停靠、装卸与维护的基础设施。|货币,铸币,纸钞,纸币,银锭,铜钱~作为交换媒介被普遍接受的物品，是复杂经济体系得以运转的基础。|银行,信用,保险,证券,股票,交易所,金融~现代金融体系的核心机构，让资金可以在时间与空间上高效配置。|法律,法典,罗马法,宪法,陪审团,律师,诉讼~规定社会成员权利与义务的规则体系。|大学,学校,教育,书院,学位,图书馆~知识传承与创新的核心机构。|电商,淘宝,Amazon,京东,拼多多,电子商务,阿里巴巴~在线完成商品交易，让购物摆脱了时间和空间的限制。|' +
+'远程办公,Zoom,Teams,飞书,钉钉,Slack~让工作地点与生活地点不再绑定的新型工作方式。|数字货币,比特币,稳定币,央行数字货币,数字支付,支付宝,微信支付~基于密码学与分布式账本的新型货币形态。|算法治理,AI治理,AI伦理,AI安全,内容审核~对AI系统的设计、部署和使用进行规范，以确保其符合人类价值。|星际文明,卡尔达肖夫,银河帝国,星际联邦,跨星际外交~把视野扩展到整个星系甚至宇宙的文明形态。|后稀缺,后劳动,全民基本收入,通用基本服务~当物质极大丰富，工作不再是生存必需的社会形态。|模拟,元宇宙,虚拟世界,数字天堂,虚拟伊甸园~一个可以完全沉浸其中的数字世界。|' +
+'乌托邦,共产主义,社会主义,资本主义,福利国家~关于理想社会形态的构想与实践。|民主,共和,议会,选举,普选,参政权~以公民参与为基础的政治制度。|核弹,原子弹,氢弹,中子弹,核武器,核威慑~利用核反应释放巨大能量的武器，是人类历史上最具毁灭性的力量。|导弹,弹道,巡航,高超音速,洲际导弹,反舰,防空~自带动力并可以制导的飞行武器，是现代战争的核心打击手段。|无人机作战,蜂群,自主武器,察打一体~无需人员直接操控的作战平台，正在改变战争的面貌。|网络战,网络攻击,勒索软件,零日漏洞,高级持续性~在网络空间中进行的攻防对抗，无需一枪一弹即可造成巨大破坏。|' +
+'激光,电磁炮,定向能,粒子束,电磁脉冲~以光速或接近光速投射能量的武器。|坦克,装甲车,自行火炮,装甲列车~集火力、防护与机动于一体的陆战平台。|航母,战列舰,驱逐舰,护卫舰,巡洋舰,铁甲舰~大型水面战舰，是一个国家海军力量的象征。|雷达,声呐,相控阵,电子对抗,电子战~通过发射和接收波来探测目标的位置、速度与特征。|隐身,隐形~通过外形设计或吸波材料，大幅降低被雷达探测的概率。|生化,化学武器,生物武器,神经毒气,芥子气,炭疽~利用毒剂或病原体造成大规模杀伤的武器，被国际公约严格禁止。|' +
+'引力武器,黑洞炸弹,维度武器,时间武器,因果武器,现实扭曲,维度撕裂~操纵宇宙基本力量或时空结构的武器，其威力已经超出了常规物理的范畴。|灰蛊,自我复制,冯诺依曼,纳米武器~能够自我复制的纳米或机械系统，一旦失控理论上可以吞噬整个行星。|量子武器,量子纠缠武器,量子雷达,量子自杀~利用量子力学特性进行攻击或防御的武器。|枪,步枪,手枪,机枪,火炮,手榴弹,刺刀~轻武器与常规火炮，步兵作战的基础装备。|城堡,要塞,城墙,护城河,壕沟,地堡~防御工事，用来保护城市或军队免受攻击。|弩,弓,投石,攻城,云梯,撞城车~古代的远程与攻城器械。'
+).split('|').map(r => { const i = r.indexOf('~'); return [r.slice(0, i).split(','), r.slice(i + 1)]; });
+const ERA_CONTEXT_VARIANTS = [
+  ['在漫长的史前岁月中','在人类还没有文字的时代','在旧石器时代的荒野里','在远古部落的火塘边'],
+  ['当人类第一次播下种子','随着农业与城市的兴起','在文明的黎明时分','在青铜与文字的年代'],
+  ['在古典文明的黄金时代','当希腊哲学与罗马法并存','在地中海文明的鼎盛期','在轴心时代的东西方'],
+  ['在中世纪的修道院与作坊里','当骑士与学者并存的年代','在封建时代的漫漫长夜里','在十字军东征的前后'],
+  ['当文艺复兴的曙光照亮欧洲','在航海家们驶向未知的时代','当哥白尼的日心说挑战权威','在印刷术让知识广泛传播的年代'],
+  ['当蒸汽机第一次轰鸣','在工厂烟囱林立的年代','当铁路把大陆连成一体','在钢铁与煤炭的世纪'],
+  ['当电灯点亮城市之夜','在无线电波穿越大陆的时代','当计算机第一次被点亮','在核能与航天的年代'],
+  ['在互联网连接世界的年代','当代码开始改变每一个行业','在信息爆炸的时代','当智能手机走进每个人口袋'],
+  ['在遥远的未来纪元','当人类跨出行星的年代','在星际文明的曙光中','当技术与魔法难以分辨之时'],
+];
+function hashStr(str){
+  let h = 5381;
+  for(let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) & 0x7fffffff;
+  return h;
+}
+function getActualYear(node){
+  const known = KNOWN_YEARS[node.name];
+  if(typeof known === 'number') return { year: known, exact: true };
+  const def = ERA_DEFS[node.era];
+  return { year: def.y0 + (def.y1 - def.y0) * node.timeProgress, exact: false };
+}
+/* ============================================================
+   【门类句干库】每类 15 条，其中带 {name} 的会自动替换成科技名。
+   它与"时代开场"和"收尾句"组合，保证 5000+ 条简介文字互不重复。
+   每个门类多写几条 = 句式重复率更低
+   ============================================================ */
+const DESC_STEM = {
+  power: '它把散落在自然界里的能量收拢起来，变成可以按需调用的力量|能量的获取方式因此改变，人类能支配的力量上限被重新划定|「{name}」让能量的转换效率跨过了一道此前难以逾越的门槛|这是对能量形态的一次重新安排：把不可控的释放变成可控的输出|从此能量的来源不再受限于眼前这堆燃料，而是伸向更远的尺度|每一次点火、每一次约束，都是把自然的暴力驯化成稳定的供给|它解决的是同一个老问题——如何用更少的代价换来更持久的动力|能量的密度与稳定性被同时抬高，工业的边界随之外扩|「{name}」把能量的搬运变成了工程问题，而不是运气问题|这背后是对能量流转的一次精细调度，浪费被压到了更低的水平|它让人类第一次可以按自己的节奏，支配原本只属于天体尺度的能量|从获取到储存再到输送，这条链条上的每一环都因它而更紧实|能量的门槛降低之后，能做的事情忽然多了起来|它把「燃料」这个概念本身，推向了更抽象的形式|有了它，能量不再只是消耗品，而成为可以被精确调配的资源'.split('|'),
+  material: '它扩展了人类手边可用的物质基础，让工具、器物与建筑有了新的可能|「{name}」的意义在于性能曲线的整体抬升，而不只是某个指标的突破|从原料到成品，这条工艺链条上的每一道工序都被重新定义|它让材料的强度、重量与耐久不再彼此掣肘，可以同时被追求|这是把原子层面的排布变成可控变量的一次尝试|造物的自由度因此变大，过去只能迁就材料的设计开始迁就想法|「{name}」让制造从经验的累积，转向可以被计算与复现的流程|它改变的是最底层的东西——一件器物能达到的上限|材料的边界一旦外扩，整条产业链都会跟着重排|它把自然界存在的物质，改造成了自然界不曾有过的物质|更轻、更硬、更耐用的组合第一次成为可能|这项工艺让量产与精密不再是二选一的题目|「{name}」让废料与新料之间的界线变得模糊|它决定的不只是产品的外观，还有产品能否被造出来|当基础材料换代，上层的一切设计都要重新思考'.split('|'),
+  info: '它改变了信息的记录、传输或处理方式，让知识可以更高效地积累与传播|「{name}」把原本模糊的经验，变成了可以被保存和复制的形式|信息第一次可以脱离载体，在更广阔的范围里流动|它让「知道」这件事的成本大幅下降|这是把思考过程本身变成可操作对象的一步|从存储到检索再到推演，每个环节的效率都被重新定义|「{name}」让人类的集体记忆有了更稳固的着落点|它改变的不只是速度，还有哪些信息值得被留下来|当信息可以被精确编排，决策的依据也随之改变|它把不可见的规律，变成了可以被反复使用的工具|知识的传递不再依赖面对面的传授，而可以跨越时间与距离|这一层抽象一旦建立，上层的应用便有了共同的底座|「{name}」让复杂系统第一次能够被人完整地描述|它处理的是规模问题：当数量超过直觉所能把握的极限|信息的价值因它而被重新估算，冗余与噪声开始被主动剔除'.split('|'),
+  bio: '它改善了人类的健康与生命质量，也拓展了我们对生命本身的理解|「{name}」让身体的秘密第一次可以被系统地观察与干预|它把疾病从命运的范畴，拉进了可以被处理的范畴|生命过程中的某些环节，从此不再是不可触碰的黑箱|它延长的不只是寿命，还有健康地活着的时间|「{name}」让治疗从缓解症状，转向针对根源|这是人类第一次以工程的方式介入自身的构造|它改变了医生能做的事，也改变了病人可以期待的事|从诊断到干预，每一步的精度都被抬高了一个量级|它让个体差异从治疗的干扰项，变成了方案的依据|「{name}」把身体的自我修复能力，变成了可以调用的资源|痛苦被减轻，恢复被加速，代价被摊薄|它处理的是一道古老的难题：如何与自身的有限性相处|当生命可以被读取，改写它的选项也随之出现|它带来的是能力，同时也带来了必须回答的问题'.split('|'),
+  transport: '这一突破重新定义了距离，让人类与物资得以跨越更广阔的空间|「{name}」把原本需要数月的旅程，压缩进了可以规划的日程|它改变的不只是速度，还有哪些地方值得去、哪些地方可以住|空间的阻隔被削弱之后，文明的形态也随之改变|从出发到抵达，中间的不确定性被大幅压缩|「{name}」让远方不再是一个需要下决心才能谈的话题|它把移动的成本降到了普通人可以承担的水平|这是人类活动半径的一次实质外扩|运输能力一旦跃升，经济与文化的版图都会重画|它让「同时」这件事在地理上第一次变得可能|「{name}」拓宽的是通道，也是想象力能够抵达的边界|当进出某地变得容易，那个地方的价值就被重新评估|它处理的是如何把人与物安全、准时、成规模地送到别处|地面、海洋、天空乃至更远的地方，都因它而更近|这一环打通之后，整张网络的效率都跟着提升'.split('|'),
+  society: '这一制度或观念重新塑造了人类协作与组织的方式|「{name}」让陌生人之间的大规模合作成为可能|它把原本依赖人情与默契的事，变成了可以被普遍执行的规则|信任的建立方式因此改变，交易的范围随之扩大|它重新分配了权利与义务，也重新定义了谁有资格说话|「{name}」让秩序从强者的意志，转向可预期的程序|这是对「我们该如何一起生活」的一次新回答|它让个体的选择空间与集体的行动能力同时变化|组织的规模一旦突破某个门槛，治理方式就必须重写|它把抽象的共识，固化成了可以运转的日常|「{name}」改变了知识、财富与机会在人群中的分布|它让协作的半径超出了血缘与地缘的限制|这一安排的长处与代价，都要过很久才会完全显现|它处理的是如何在差异之中维持某种共同的生活|当规则被普遍接受，社会的运行成本就整体下降'.split('|'),
+  military: '这一军事技术改变了冲突的形态，也深刻影响了政治格局|「{name}」让攻与防之间的天平重新倾斜|它把战争从勇气的较量，推向了工业与技术的较量|优势的取得方式因此改变，数量不再是唯一的答案|它使某些曾经安全的距离，第一次变得不再安全|「{name}」提高了冲突的代价，也因此改变了决策者的算计|这是把毁灭能力推向更远、更快、更精确的一步|它改变了战场的样子，也改变了战场之外的生活|威慑的逻辑因它而变：不被使用，本身就是它的作用|它让防御必须重新设计，也让进攻的窗口变得更短|「{name}」把决定胜负的时间压缩到了对手来不及反应的尺度|它带来的不只是力量，还有对使用这种力量的约束|技术上的领先，往往在这一刻被兑换成政治上的筹码|它处理的是如何在对抗中保存自己、削弱对方|武器的形状变了，使用它的人所要承担的责任也变了'.split('|'),
+};
+const DESC_TAIL = '。它的出现让后来的一切都显得顺理成章。|，而这一步一旦迈出，就再也回不去了。|。这是那种当时不起眼、回头看却决定走向的一步。|。它改变的不只是能力，还有人们对「可能」的定义。|，此后的事情，都建立在它之上。|。从此后来者不必再从零开始。|。这一小步，后来被证明是整条路径的转折点。|。类似的尝试还有很多，但真正留下来的并不多。|，它的影响要过很久才会被完全看清。|。技术本身没有立场，用它的人有。|。它把一个问题解决了，也顺手带来了新的问题。|，人类与世界的相处方式因此多了一种选择。|。回头看，它更像是必然，而不是偶然。|。这一步的代价与收益，至今仍在被重新计算。|，它为后面更激进的想法腾出了空间。|。许多后来者沿着这条路走了很远。|。它证明了一件事：边界比想象中更容易被推动。|，而这只是更长链条上的一个环节。|。当时的人未必意识到，自己正站在分岔口。|。它的价值不在当下，而在它打开的那扇门。|，此后类似的思路被反复借用。|。它让原本遥远的东西，忽然变得触手可及。|。从它开始，问题变成了「如何做得更好」。|，这一改变是缓慢的，却是不可逆的。|。它安静地改写了某些事物的上限。|，而真正的影响往往发生在它的外围。|。它同时是答案，也是下一个问题的起点。|。历史在这里拐了一个不易察觉的弯。|，它让后来的人省下了大量重复的摸索。|。无论评价如何，它都已经改变了起点。'.split('|');
+function matchKeywordDesc(name){
+  for(const [keys, desc] of KEYWORD_DESCS){
+    for(const k of keys){
+      if(name.includes(k)) return desc;
+    }
+  }
+  return null;
+}
+/* 【简介唯一化】按 时代开场 × 门类句干 × 收尾句 组合，
+   用 used 集合记录已用过的文字，冲突就换下一种组合。
+   这样即使同一门类有几百个科技，文字也不会撞车 */
+function makeUniqueDesc(node, used){
+  const opens = ERA_CONTEXT_VARIANTS[node.era] || ERA_CONTEXT_VARIANTS[0];
+  const kw = matchKeywordDesc(node.name);
+  const stems = kw ? [kw] : (DESC_STEM[node.cat] || DESC_STEM.info);
+  const total = opens.length * stems.length * DESC_TAIL.length;
+  const start = hashStr(node.name) % total;
+  for(let s = 0; s < total; s++){
+    const k = (start + s) % total;
+    const oi = Math.floor(k / (stems.length * DESC_TAIL.length)) % opens.length;
+    const si = Math.floor(k / DESC_TAIL.length) % stems.length;
+    const ti = k % DESC_TAIL.length;
+    const stemTxt = stems[si].replace(/[。！？]+$/, '');
+    const text = (opens[oi] + '，' + stemTxt + DESC_TAIL[ti]).replace(/\{name\}/g, node.name);
+    if(!used.has(text)){ used.add(text); return text; }
+  }
+  const fb = opens[0] + '，这是' + node.name + '留下的印记，它后来融进了更长的技术脉络里。';
+  let i = 2, v = fb;
+  while(used.has(v)) v = fb.replace('。', '（' + (i++) + '）。');
+  used.add(v);
+  return v;
+}
+(function assignDescriptions(){
+  const used = new Set();
+  NODES.forEach(n => { n.desc = makeUniqueDesc(n, used); });
+})();
+/* 【年份格式化】把数字年份转成"公元前300万年 / 公元2024年"
+   1万以上自动用"万"为单位，让远古年代不至于拖一长串数字 */
+function formatYear(y){
+  const neg = y < 0, a = Math.abs(y);
+  let str;
+  if(a >= 10000){
+    const w = a / 10000;
+    str = ((w >= 100 || Math.abs(w - Math.round(w)) < 0.05) ? Math.round(w).toString() : w.toFixed(1)) + '万';
+  } else str = Math.round(a).toString();
+  return (neg ? '公元前' : '公元') + str + '年';
+}
+function getYear(t){
+  const ei = Math.min(ERA_DEFS.length - 1, Math.max(0, Math.floor(t)));
+  const ep = THREE.MathUtils.clamp(t - ei, 0, 1);
+  const def = ERA_DEFS[ei];
+  return def.y0 + (def.y1 - def.y0) * ep;
+}
+const canvas = document.getElementById('scene');
+const isMobile = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent);
+/* ============================================================
+   【WebGL 渲染器】setPixelRatio 的第二个参数是清晰度上限：
+   调高=更锐利但更吃显卡；移动端默认压到 1.8，桌面 2.5
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:!isMobile, alpha:false, powerPreference:'high-performance', stencil:false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1.8 : 2.5));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.setClearColor(0x010208, 1);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x010208, 0.00035);
+/* 【透视相机】55 是视野角度（FOV）——调大=广角、星云显得更靠近；
+   调小=长焦、压缩空间感。后两个数字是近/远裁剪面 */
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 60000);
+function makeStarTex(){
+  const size = 64, c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.25, 'rgba(255,255,255,0.7)');
+  g.addColorStop(0.55, 'rgba(255,255,255,0.15)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  return tex;
+}
+const STAR_TEX = makeStarTex();
+/* ============================================================
+   【背景星空】三层不同大小与密度的星点叠加。
+   每层参数依次是：数量、半径范围、点大小、颜色、不透明度
+   改数量影响性能；改半径范围决定星星出现在多远的地方
+   ============================================================ */
+function addStarLayer(count, rMin, rMax, size, colorHex, opacity){
+  const pos = new Float32Array(count * 3);
+  const col = new Float32Array(count * 3);
+  const szArr = new Float32Array(count);
+  const phase = new Float32Array(count);
+  const base = new THREE.Color(colorHex), c = new THREE.Color();
+  for(let i = 0; i < count; i++){
+    const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2;
+    const sq = Math.sqrt(Math.max(0, 1 - u * u));
+    const R = rMin + Math.random() * (rMax - rMin);
+    pos[i*3] = Math.cos(th) * sq * R; pos[i*3+1] = u * R; pos[i*3+2] = Math.sin(th) * sq * R;
+    c.copy(base).offsetHSL((Math.random() - 0.5) * 0.16, 0, (Math.random() - 0.5) * 0.3);
+    col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    szArr[i] = size * (0.7 + Math.random() * 0.6);
+    phase[i] = Math.random() * Math.PI * 2;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aSize', new THREE.BufferAttribute(szArr, 1).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aPhase', new THREE.BufferAttribute(phase, 1).setUsage(THREE.StaticDrawUsage));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uTex: { value: STAR_TEX }, uTime: { value: 0 }, uOpacity: { value: opacity } },
+    transparent:true, depthWrite:false, depthTest:false, blending:THREE.AdditiveBlending,
+    vertexShader: `
+      attribute float aSize; attribute float aPhase; attribute vec3 color;
+      uniform float uTime;
+      varying vec3 vColor; varying float vAlpha;
+      void main(){
+        vColor = color;
+        vAlpha = 0.72 + 0.28 * sin(uTime * 1.8 + aPhase);
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = aSize * (1.0 + 0.15 * sin(uTime * 3.0 + aPhase * 2.0));
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform sampler2D uTex; uniform float uOpacity;
+      varying vec3 vColor; varying float vAlpha;
+      void main(){
+        vec4 t = texture2D(uTex, gl_PointCoord);
+        gl_FragColor = vec4(vColor * t.rgb * 1.2, t.a * vAlpha * uOpacity);
+      }`
+  });
+  const p = new THREE.Points(g, mat);
+  p.frustumCulled = false; p.matrixAutoUpdate = false; p.renderOrder = -50;
+  scene.add(p);
+  return mat;
+}
+const starMats = [
+  addStarLayer(isMobile ? 2800 : 4800, 5000, 9000, 5, 0xc8d4ff, 0.55),
+  addStarLayer(isMobile ? 1000 : 1800, 3500, 6000, 8, 0xa8bcf0, 0.75),
+  addStarLayer(isMobile ? 320 : 560, 2200, 4200, 14, 0xffffff, 0.9),
+];
+/* 【彩色星云】若干半透明光斑做背景氛围。
+   count 控制星云块数，opacity 那一行的随机范围控制浓淡 */
+(function makeNebulae(){
+  const size = 512, c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  for(let layer = 0; layer < 3; layer++){
+    const g = ctx.createRadialGradient(size/2 + (Math.random()-0.5)*80, size/2 + (Math.random()-0.5)*80, 0, size/2, size/2, size/2);
+    g.addColorStop(0, 'rgba(255,255,255,' + (0.5 - layer*0.12) + ')');
+    g.addColorStop(0.3, 'rgba(255,255,255,' + (0.2 - layer*0.05) + ')');
+    g.addColorStop(0.7, 'rgba(255,255,255,0.03)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
+  }
+  const img = ctx.getImageData(0, 0, size, size);
+  for(let i = 0; i < img.data.length; i += 4){
+    const n = (Math.random() - 0.5) * 40;
+    img.data[i] = Math.min(255, Math.max(0, img.data[i] + n));
+    img.data[i+1] = Math.min(255, Math.max(0, img.data[i+1] + n));
+    img.data[i+2] = Math.min(255, Math.max(0, img.data[i+2] + n));
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  const colors = [0x2b4a9c, 0x4a2d78, 0x1f5d70, 0x6b2f54, 0x2d5a3d, 0x3a3a8a, 0x6a3fa0, 0x8a4f8a];
+  const group = new THREE.Group();
+  const count = isMobile ? 8 : 14;
+  for(let i = 0; i < count; i++){
+    const mat = new THREE.SpriteMaterial({
+      map: tex, color: colors[i % colors.length], transparent: true,
+      opacity: 0.14 + Math.random() * 0.14, blending: THREE.AdditiveBlending,
+      depthWrite: false, depthTest: false, fog: false,
+    });
+    const spr = new THREE.Sprite(mat);
+    const R = 2500 + Math.random() * 3500;
+    const th = Math.random() * Math.PI * 2;
+    const phi = Math.acos(Math.random() * 1.5 - 0.75);
+    spr.position.set(R * Math.sin(phi) * Math.cos(th), R * Math.cos(phi) * 0.6, R * Math.sin(phi) * Math.sin(th));
+    const s2 = 1400 + Math.random() * 2000;
+    spr.scale.set(s2, s2, 1);
+    spr.matrixAutoUpdate = false; spr.updateMatrix();
+    group.add(spr);
+  }
+  group.renderOrder = -100;
+  scene.add(group);
+})();
+/* ============================================================
+   【共用顶点着色器】光点与拖尾都用它。在 GPU 里逐点计算：
+   抖动位移、终局膨胀(uExpand)、轨道自转(uSpinTime)、
+   以及 gl_PointSize（光点在屏幕上的像素直径） */
+const SHARED_VERTEX = `
+  attribute float aSize;
+  attribute float aAlpha;
+  attribute vec3 aColor;
+  attribute float aPhase;
+  attribute float aFreq;
+  attribute float aSpinSpeed;
+  attribute vec3 aSpinAxis;
+  uniform float uScale;
+  uniform float uTime;
+  uniform float uExpand;
+  uniform float uSpinTime;
+  uniform float uTrailDelay;
+  varying vec3 vColor;
+  varying float vAlpha;
+  void main(){
+    vColor = aColor;
+    vAlpha = aAlpha;
+    float t = uTime;
+    float f = aFreq, p = aPhase;
+    vec3 off;
+    off.x = sin(t * f        + p       ) * ${WA.toFixed(4)}
+          + sin(t * f * 0.17 + p * 1.30 ) * ${DA.toFixed(4)};
+    off.y = sin(t * f * 1.13 + p + 1.70) * ${WA.toFixed(4)}
+          + sin(t * f * 0.13 + p * 0.90 + 2.10) * ${DA.toFixed(4)};
+    off.z = sin(t * f * 0.87 + p + 3.40) * ${WA.toFixed(4)}
+          + sin(t * f * 0.19 + p * 1.10 + 4.30) * ${DA.toFixed(4)};
+    vec3 dp = position + off;
+    if(uExpand > 0.001){
+      float len = length(position);
+      vec3 radialDir = len > 0.001 ? position / len : vec3(0.0, 1.0, 0.0);
+      dp += radialDir * uExpand;
+    }
+    if(uSpinTime > 0.0001){
+      float st = max(0.0, uSpinTime - uTrailDelay);
+      float ang = st * aSpinSpeed;
+      float cs = cos(ang), sn = sin(ang), ic = 1.0 - cs;
+      vec3 k = aSpinAxis;
+      vec3 v = dp;
+      dp = v * cs + cross(k, v) * sn + k * dot(k, v) * ic;
+    }
+    vec4 mv = modelViewMatrix * vec4(dp, 1.0);
+    float d = max(-mv.z, 0.05);
+    float ps = aSize * uScale / d;
+    gl_PointSize = clamp(ps, 0.0, 22.0);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+const N = NODES.length;
+function buildGeom(scaleSize){
+  const g = new THREE.BufferGeometry();
+  const pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  const sz = new Float32Array(N), al = new Float32Array(N);
+  const ph = new Float32Array(N), fr = new Float32Array(N);
+  const spd = new Float32Array(N);
+  const sax = new Float32Array(N * 3);
+  for(let i = 0; i < N; i++){
+    const n = NODES[i];
+    pos[i*3] = n.pos.x; pos[i*3+1] = n.pos.y; pos[i*3+2] = n.pos.z;
+    col[i*3] = n.color.r; col[i*3+1] = n.color.g; col[i*3+2] = n.color.b;
+    sz[i] = n.baseSize * scaleSize;
+    ph[i] = n.phase; fr[i] = n.freq;
+    spd[i] = n.spinSpeed;
+    sax[i*3] = n.spinAxis.x; sax[i*3+1] = n.spinAxis.y; sax[i*3+2] = n.spinAxis.z;
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aColor', new THREE.BufferAttribute(col, 3).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aSize', new THREE.BufferAttribute(sz, 1).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aAlpha', new THREE.BufferAttribute(al, 1).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aPhase', new THREE.BufferAttribute(ph, 1).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aFreq', new THREE.BufferAttribute(fr, 1).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aSpinSpeed', new THREE.BufferAttribute(spd, 1).setUsage(THREE.StaticDrawUsage));
+  g.setAttribute('aSpinAxis', new THREE.BufferAttribute(sax, 3).setUsage(THREE.StaticDrawUsage));
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4000);
+  return g;
+}
+/* 【科技光点】buildGeom(1.0) 里的 1.0 是尺寸系数；
+   光点样式见下方 fragmentShader——星球般的漫反射球体 */
+const nodeGeo = buildGeom(1.0);
+const nodeUniforms = { uScale:{value:800}, uTime:{value:0}, uExpand:{value:0}, uSpinTime:{value:0}, uTrailDelay:{value:0} };
+const nodeMat = new THREE.ShaderMaterial({
+  uniforms: nodeUniforms, transparent:true, depthWrite:false, depthTest:true, blending:THREE.AdditiveBlending,
+  vertexShader: SHARED_VERTEX,
+  fragmentShader: `
+    varying vec3 vColor; varying float vAlpha;
+    void main(){
+      vec2 p = gl_PointCoord * 2.0 - 1.0;
+      float r = length(p);
+      if(r > 1.13) discard;
+      if(r <= 1.0){
+        vec3 n = vec3(p, sqrt(max(0.0, 1.0 - r * r)));
+        vec3 L = normalize(vec3(-0.48, 0.44, 0.76));
+        float diff = max(dot(n, L), 0.0);
+        float limb = 1.0 - r * r;
+        float light = 0.28 + diff * 0.72;
+        vec3 col = vColor * light * (0.66 + limb * 0.34) * 1.06;
+        gl_FragColor = vec4(col, vAlpha * (0.66 + limb * 0.34));
+        return;
+      }
+      float g = clamp((r - 1.0) / 0.13, 0.0, 1.0);
+      float glow = (1.0 - g) * (1.0 - g);
+      gl_FragColor = vec4(vColor * glow * 0.80, glow * 0.36 * vAlpha);
+    }`
+});
+const nodePoints = new THREE.Points(nodeGeo, nodeMat);
+nodePoints.frustumCulled = false; nodePoints.matrixAutoUpdate = false;
+scene.add(nodePoints);
+const trailGeo = buildGeom(0.92);
+const trailUniforms = { uScale:{value:800}, uTime:{value:0}, uExpand:{value:0}, uSpinTime:{value:0},
+  uTrailDelay:{value:TRAIL_DELAY}, uTrailOpacity:{value:0} };
+const trailMat = new THREE.ShaderMaterial({
+  uniforms: trailUniforms, transparent:true, depthWrite:false, depthTest:true, blending:THREE.AdditiveBlending,
+  vertexShader: SHARED_VERTEX,
+  fragmentShader: `
+    uniform float uTrailOpacity;
+    varying vec3 vColor; varying float vAlpha;
+    void main(){
+      vec2 p = gl_PointCoord - 0.5;
+      float d = length(p) * 2.0;
+      if(d > 1.0) discard;
+      float core = smoothstep(0.85, 0.0, d);
+      float halo = exp(-d * d * 2.2) * 0.55;
+      float a = (core * 0.85 + halo) * vAlpha * uTrailOpacity;
+      vec3 col = vColor * (0.7 + core * 1.2) + vColor * halo * 0.6;
+      gl_FragColor = vec4(col, a);
+    }`
+});
+const trailPoints = new THREE.Points(trailGeo, trailMat);
+trailPoints.frustumCulled = false; trailPoints.matrixAutoUpdate = false;
+scene.add(trailPoints);
+const linePositions = [], lineColors = [], lineVertNodeIdx = [];
+const catNodeIdx = {};
+CATS.forEach(c => catNodeIdx[c.key] = []);
+NODES.forEach((n, i) => catNodeIdx[n.cat].push(i));
+CATS.forEach(c => catNodeIdx[c.key].sort((a, b) => NODES[a].appear - NODES[b].appear));
+/* 【连线距离上限】同门类里相邻时间的两点距离小于此值才连线。
+   调大=连线更密（像蛛网）；调小=只连最近的，更稀疏清爽 */
+const MAX_SEG_DIST = 55;
+CATS.forEach(c => {
+  const arr = catNodeIdx[c.key];
+  const col = CAT_COLOR[c.key];
+  for(let k = 0; k < arr.length - 1; k++){
+    const i1 = arr[k], i2 = arr[k + 1];
+    const p1 = NODES[i1].pos, p2 = NODES[i2].pos;
+    if(p1.distanceTo(p2) > MAX_SEG_DIST) continue;
+    linePositions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+    lineColors.push(col.r, col.g, col.b, col.r, col.g, col.b);
+    lineVertNodeIdx.push(i1, i2);
+  }
+});
+const LINE_COUNT = lineVertNodeIdx.length;
+const lineGeo = new THREE.BufferGeometry();
+{
+  const lpos = new Float32Array(linePositions);
+  const lcol = new Float32Array(lineColors);
+  const lalpha = new Float32Array(LINE_COUNT);
+  const lphase = new Float32Array(LINE_COUNT);
+  const lfreq = new Float32Array(LINE_COUNT);
+  const lspd = new Float32Array(LINE_COUNT);
+  const laxis = new Float32Array(LINE_COUNT * 3);
+  for(let k = 0; k < LINE_COUNT; k++){
+    const idx = lineVertNodeIdx[k];
+    lphase[k] = NODES[idx].phase; lfreq[k] = NODES[idx].freq; lspd[k] = NODES[idx].spinSpeed;
+    laxis[k*3] = NODES[idx].spinAxis.x;
+    laxis[k*3+1] = NODES[idx].spinAxis.y;
+    laxis[k*3+2] = NODES[idx].spinAxis.z;
+  }
+  lineGeo.setAttribute('position', new THREE.BufferAttribute(lpos, 3).setUsage(THREE.StaticDrawUsage));
+  lineGeo.setAttribute('aColor', new THREE.BufferAttribute(lcol, 3).setUsage(THREE.StaticDrawUsage));
+  lineGeo.setAttribute('aAlpha', new THREE.BufferAttribute(lalpha, 1).setUsage(THREE.DynamicDrawUsage));
+  lineGeo.setAttribute('aPhase', new THREE.BufferAttribute(lphase, 1).setUsage(THREE.StaticDrawUsage));
+  lineGeo.setAttribute('aFreq', new THREE.BufferAttribute(lfreq, 1).setUsage(THREE.StaticDrawUsage));
+  lineGeo.setAttribute('aSpinSpeed', new THREE.BufferAttribute(lspd, 1).setUsage(THREE.StaticDrawUsage));
+  lineGeo.setAttribute('aSpinAxis', new THREE.BufferAttribute(laxis, 3).setUsage(THREE.StaticDrawUsage));
+  lineGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4000);
+}
+const lineUniforms = { uTime:{value:0}, uExpand:{value:0}, uSpinTime:{value:0} };
+const lineMat = new THREE.ShaderMaterial({
+  uniforms: lineUniforms, transparent:true, depthWrite:false, depthTest:true, blending:THREE.AdditiveBlending,
+  vertexShader: `
+    attribute vec3 aColor; attribute float aAlpha; attribute float aPhase;
+    attribute float aFreq; attribute float aSpinSpeed; attribute vec3 aSpinAxis;
+    uniform float uTime; uniform float uExpand; uniform float uSpinTime;
+    varying vec3 vColor; varying float vAlpha;
+    void main(){
+      vColor = aColor; vAlpha = aAlpha;
+      float t = uTime, f = aFreq, p = aPhase;
+      vec3 off;
+      off.x = sin(t*f + p) * ${WA.toFixed(4)} + sin(t*f*0.17 + p*1.30) * ${DA.toFixed(4)};
+      off.y = sin(t*f*1.13 + p + 1.70) * ${WA.toFixed(4)} + sin(t*f*0.13 + p*0.90 + 2.10) * ${DA.toFixed(4)};
+      off.z = sin(t*f*0.87 + p + 3.40) * ${WA.toFixed(4)} + sin(t*f*0.19 + p*1.10 + 4.30) * ${DA.toFixed(4)};
+      vec3 dp = position + off;
+      if(uExpand > 0.001){
+        float len = length(position);
+        vec3 radialDir = len > 0.001 ? position / len : vec3(0.0, 1.0, 0.0);
+        dp += radialDir * uExpand;
+      }
+      if(uSpinTime > 0.0001){
+        float ang = uSpinTime * aSpinSpeed;
+        float cs = cos(ang), sn = sin(ang), ic = 1.0 - cs;
+        vec3 k = aSpinAxis;
+        vec3 v = dp;
+        dp = v * cs + cross(k, v) * sn + k * dot(k, v) * ic;
+      }
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(dp, 1.0);
+    }`,
+  fragmentShader: `
+    varying vec3 vColor; varying float vAlpha;
+    void main(){
+      if(vAlpha <= 0.001) discard;
+      gl_FragColor = vec4(vColor * 0.9, vAlpha * 0.24);
+    }`
+});
+const lineSeg = new THREE.LineSegments(lineGeo, lineMat);
+lineSeg.frustumCulled = false; lineSeg.matrixAutoUpdate = false;
+scene.add(lineSeg);
+const lineAlphaData = lineGeo.attributes.aAlpha.array;
+/* 【时代圆环】每个球壳边界画一圈细环，帮助辨识时代层次。
+   环的粗细由 TorusGeometry 的第二个半径参数控制 */
+const rings = [];
+const RING_COUNT = ERA_DEFS.length;
+for(let i = 1; i <= RING_COUNT; i++){
+  const r = RADII[i];
+  const m = new THREE.MeshBasicMaterial({
+    color: new THREE.Color().setHSL(0.58 - i * 0.045, 0.85, 0.62),
+    transparent:true, opacity:0, depthWrite:false, blending:THREE.AdditiveBlending
+  });
+  const mesh = new THREE.Mesh(new THREE.TorusGeometry(r, Math.max(0.06, r*0.0030), 5, 200), m);
+  mesh.rotation.x = Math.PI / 2; mesh.frustumCulled = false;
+  mesh.matrixAutoUpdate = false; mesh.updateMatrix();
+  scene.add(mesh);
+  const dotCount = isMobile ? 120 : 180;
+  const dp = new Float32Array(dotCount * 3);
+  for(let k = 0; k < dotCount; k++){
+    const ang = (k / dotCount) * Math.PI * 2;
+    dp[k*3] = Math.cos(ang) * r;
+    dp[k*3+1] = (Math.random() - 0.5) * 0.4;
+    dp[k*3+2] = Math.sin(ang) * r;
+  }
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute('position', new THREE.BufferAttribute(dp, 3).setUsage(THREE.StaticDrawUsage));
+  const dm = new THREE.PointsMaterial({
+    color: m.color, size: 1.6, sizeAttenuation: false,
+    transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending
+  });
+  const dmesh = new THREE.Points(dg, dm);
+  dmesh.frustumCulled = false; dmesh.matrixAutoUpdate = false;
+  scene.add(dmesh);
+  rings.push({ mesh, mat: m, radius: r, dots: dm });
+}
+/* ============================================================
+   【缩放边界】ZOOM_MIN 越小能拉得越远（看全局），
+   ZOOM_MAX 越大能凑得越近（看细节）。
+   CAM_DIST_MIN 是相机贴到最近的硬下限，防止穿模
+   ============================================================ */
+const ZOOM_MIN = 0.008, ZOOM_MAX = 1.8, CAM_DIST_MIN = 0.55;
+/* 【相机初始状态】camTheta=水平角 camPhi=俯仰角 camDist=距离
+   拖拽时 camTheta += dx * 0.0055 —— 这个 0.0055 是旋转灵敏度，
+   调大=手指轻轻一划就转很多 */
+let camTheta = 0.85, camPhi = 1.15, camDist = 30, userZoom = 1, autoRotateTimer = 0;
+let camThetaVel = 0, camPhiVel = 0;
+const target = new THREE.Vector3();
+function updateCamera(){
+  const sp = Math.sin(camPhi);
+  camera.position.set(
+    camDist * sp * Math.cos(camTheta),
+    camDist * Math.cos(camPhi),
+    camDist * sp * Math.sin(camTheta)
+  );
+  camera.lookAt(target);
+}
+const pointers = new Map();
+let dragging = false, lastX = 0, lastY = 0, pinchDist = 0;
+let pointerDownX = 0, pointerDownY = 0, pointerDownTime = 0, pointerMoved = false;
+let lastMoveTime = 0;
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if(pointers.size === 1){
+    dragging = true;
+    lastX = e.clientX; lastY = e.clientY;
+    pointerDownX = e.clientX; pointerDownY = e.clientY;
+    pointerDownTime = performance.now();
+    lastMoveTime = performance.now();
+    pointerMoved = false;
+    camThetaVel = 0; camPhiVel = 0;
+  }
+  autoRotateTimer = 0;
+});
+canvas.addEventListener('pointermove', e => {
+  if(!pointers.has(e.pointerId)){
+    if(e.pointerType === 'mouse' && pointers.size === 0) scheduleHoverCheck(e.clientX, e.clientY);
+    return;
+  }
+  pointers.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if(pointers.size === 2){
+    const pts = [...pointers.values()];
+    const nd = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    if(pinchDist > 0) userZoom = THREE.MathUtils.clamp(userZoom / (nd / pinchDist), ZOOM_MIN, ZOOM_MAX);
+    pinchDist = nd; dragging = false; pointerMoved = true;
+    autoRotateTimer = 0;
+    return;
+  }
+  if(dragging){
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    if(Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 6) pointerMoved = true;
+    camTheta += dx * 0.0055;
+    camPhi = THREE.MathUtils.clamp(camPhi - dy * 0.0055, 0.12, Math.PI - 0.12);
+    lastX = e.clientX; lastY = e.clientY;
+    const now = performance.now();
+    const dtMove = Math.max((now - lastMoveTime) / 1000, 0.008);
+    lastMoveTime = now;
+    camThetaVel = camThetaVel * 0.5 + ((dx * 0.0055) / dtMove) * 0.5;
+    camPhiVel = camPhiVel * 0.5 + ((-dy * 0.0055) / dtMove) * 0.5;
+    autoRotateTimer = 0;
+  }
+});
+function endPointer(e){
+  const wasClick = !pointerMoved && (performance.now() - pointerDownTime) < 500;
+  pointers.delete(e.pointerId);
+  if(pointers.size < 2) pinchDist = 0;
+  if(pointers.size === 0) dragging = false;
+  if(wasClick && !ending){
+    const idx = pickNode(e.clientX, e.clientY);
+    if(idx >= 0) showPanel(idx);
+    else if(panelOpen) hidePanel();
+  }
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', e => {
+  pointers.delete(e.pointerId);
+  if(pointers.size < 2) pinchDist = 0;
+  if(pointers.size === 0) dragging = false;
+});
+canvas.addEventListener('pointerleave', () => hideHoverLabel());
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  userZoom = THREE.MathUtils.clamp(userZoom * Math.exp(e.deltaY * 0.0011), ZOOM_MIN, ZOOM_MAX);
+  autoRotateTimer = 0;
+}, { passive:false });
+const hoverLabelEl = document.getElementById('hoverLabel');
+const panelEl = document.getElementById('techPanel');
+const panelCatEl = document.getElementById('panelCat');
+const panelTitleEl = document.getElementById('panelTitle');
+const panelMetaEl = document.getElementById('panelMeta');
+const panelDescEl = document.getElementById('panelDesc');
+let hoveredIdx = -1, hoverLabelVisible = false, selectedIdx = -1, panelOpen = false;
+const _pv = new THREE.Vector3(), _v = new THREE.Vector3();
+function worldPos(n, t){
+  const off = physOffset(n, t);
+  let x = n.pos.x + off.x, y = n.pos.y + off.y, z = n.pos.z + off.z;
+  if(spinTime > 0.0001){
+    const a = spinTime * n.spinSpeed;
+    const c = Math.cos(a), s = Math.sin(a), ic = 1 - c;
+    const kx = n.spinAxis.x, ky = n.spinAxis.y, kz = n.spinAxis.z;
+    const kdotv = kx * x + ky * y + kz * z;
+    const cx = ky * z - kz * y;
+    const cy = kz * x - kx * z;
+    const cz = kx * y - ky * x;
+    const nx = x * c + cx * s + kx * kdotv * ic;
+    const ny = y * c + cy * s + ky * kdotv * ic;
+    const nz = z * c + cz * s + kz * kdotv * ic;
+    x = nx; y = ny; z = nz;
+  }
+  _pv.set(x, y, z);
+  return _pv;
+}
+/* 【点击拾取】把每个已解锁光点投影到屏幕，找离手指最近的一个。
+   MAX_R=26 是最大命中半径（像素），调大=更容易点到 */
+function pickNode(clientX, clientY){
+  const sArr = nodeGeo.attributes.aSize.array;
+  const aArr = nodeGeo.attributes.aAlpha.array;
+  const uScale = nodeUniforms.uScale.value;
+  let best = -1, bestScore = Infinity;
+  const MAX_R = 26, cx = clientX, cy = clientY;
+  for(let i = 0; i < N; i++){
+    if(aArr[i] < 0.3) continue;
+    const n = NODES[i];
+    worldPos(n, elapsed);
+    _v.copy(_pv).project(camera);
+    if(_v.z > 1) continue;
+    const sx = (_v.x * 0.5 + 0.5) * W, sy = (-_v.y * 0.5 + 0.5) * H;
+    const dx = cx - sx, dy = cy - sy;
+    const dsq = dx*dx + dy*dy;
+    if(dsq > MAX_R * MAX_R) continue;
+    const depth = Math.max(camera.position.distanceTo(_pv), 0.1);
+    const screenR = Math.max(7, Math.min(MAX_R, sArr[i] * uScale / depth / 2));
+    if(dsq < screenR * screenR && dsq < bestScore){ bestScore = dsq; best = i; }
+  }
+  return best;
+}
+function updateHoverLabel(cx, cy){
+  if(hoveredIdx >= 0){
+    const n = NODES[hoveredIdx];
+    hoverLabelEl.textContent = n.name;
+    hoverLabelEl.style.color = n.colorCss;
+    if(!hoverLabelVisible){ hoverLabelEl.classList.add('show'); hoverLabelVisible = true; }
+    hoverLabelEl.style.transform = `translate3d(${cx.toFixed(0)}px, ${cy.toFixed(0)}px, 0) translate(-50%, -160%)`;
+  } else if(hoverLabelVisible){
+    hoverLabelEl.classList.remove('show');
+    hoverLabelVisible = false;
+  }
+}
+function hideHoverLabel(){
+  if(hoverLabelVisible){ hoverLabelEl.classList.remove('show'); hoverLabelVisible = false; }
+  hoveredIdx = -1;
+}
+function showPanel(idx){
+  selectedIdx = idx;
+  const node = NODES[idx];
+  const eraDef = ERA_DEFS[node.era];
+  const { year, exact } = getActualYear(node);
+  const catObj = CATS.find(c => c.key === node.cat);
+  panelCatEl.textContent = catObj.name;
+  panelCatEl.style.color = catObj.color;
+  panelCatEl.style.background = catObj.color + '22';
+  panelCatEl.style.border = '1px solid ' + catObj.color + '55';
+  panelTitleEl.textContent = node.name;
+  let metaHtml = `<span>${eraDef.name}</span><span class="dot-sep"></span><span>${formatYear(year)}${exact ? '' : ' <span class="year-est">(约)</span>'}</span>`;
+  if(node.isMajor) metaHtml += `<span class="dot-sep"></span><span class="badge">重大成就</span>`;
+  panelMetaEl.innerHTML = metaHtml;
+  panelDescEl.textContent = node.desc || '';
+  panelEl.classList.add('show');
+  panelOpen = true;
+}
+function hidePanel(){ panelEl.classList.remove('show'); panelOpen = false; selectedIdx = -1; }
+document.getElementById('panelClose').addEventListener('click', e => { e.stopPropagation(); hidePanel(); });
+let hoverRafPending = false, pendingHoverX = 0, pendingHoverY = 0;
+function scheduleHoverCheck(cx, cy){
+  pendingHoverX = cx; pendingHoverY = cy;
+  if(hoverRafPending) return;
+  hoverRafPending = true;
+  requestAnimationFrame(() => {
+    hoverRafPending = false;
+    if(ending || pointers.size > 0) return;
+    hoveredIdx = pickNode(pendingHoverX, pendingHoverY);
+    updateHoverLabel(pendingHoverX, pendingHoverY);
+  });
+}
+let spinEnabled = false, spinFactor = 0, spinTime = 0;
+const spinBtnEl = document.getElementById('spinBtn');
+spinBtnEl.addEventListener('click', e => {
+  e.stopPropagation();
+  spinEnabled = !spinEnabled;
+  spinBtnEl.classList.toggle('active', spinEnabled);
+  spinBtnEl.setAttribute('aria-pressed', spinEnabled ? 'true' : 'false');
+});
+const infoBtnEl = document.getElementById('infoBtn');
+const infoPanelEl = document.getElementById('infoPanel');
+infoBtnEl.addEventListener('click', e => {
+  e.stopPropagation();
+  infoPanelEl.classList.add('show');
+});
+document.getElementById('infoClose').addEventListener('click', e => {
+  e.stopPropagation();
+  infoPanelEl.classList.remove('show');
+});
+const soundBtnEl = document.getElementById('soundBtn');
+let audioCtx = null;
+let masterGain = null;
+let bgmGain = null;
+let sfxGain = null;
+let spaceBus = null;
+let limiter = null;
+let reverb = null;
+let bgmStarted = false;
+let soundEnabled = true;         // 默认开启
+let lastSfxAt = 0;
+function makeIR(seconds, decay){
+  const rate = audioCtx.sampleRate, len = Math.floor(rate * seconds);
+  const buf = audioCtx.createBuffer(2, len, rate);
+  for(let ch = 0; ch < 2; ch++){
+    const d = buf.getChannelData(ch);
+    for(let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+  }
+  return buf;
+}
+/* ============================================================
+   【音频总线】信号流向：各音源 → sfx/bgm 总线 → 主增益
+   → 限幅器 → 扬声器。
+   混响用程序生成的脉冲响应(4.2 秒)模拟太空纵深；
+   全频段统一在 A 小调，音效与背景音乐不会打架 */
+function initAudio(){
+  if(audioCtx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!AC) return;
+  try { audioCtx = new AC(); } catch(err){ audioCtx = null; return; }
+  limiter = audioCtx.createDynamicsCompressor();
+  limiter.threshold.value = -6;
+  limiter.knee.value = 8;
+  limiter.ratio.value = 12;
+  limiter.attack.value = 0.004;
+  limiter.release.value = 0.25;
+  limiter.connect(audioCtx.destination);
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = soundEnabled ? 1 : 0;
+  masterGain.connect(limiter);
+  bgmGain = audioCtx.createGain();
+  bgmGain.gain.value = 1;
+  bgmGain.connect(masterGain);
+  sfxGain = audioCtx.createGain();
+  sfxGain.gain.value = 0.9;
+  sfxGain.connect(masterGain);
+  reverb = audioCtx.createConvolver();
+  reverb.buffer = makeIR(4.2, 2.4);
+  const wet = audioCtx.createGain();
+  wet.gain.value = 0.6;
+  reverb.connect(wet);
+  wet.connect(masterGain);
+  spaceBus = audioCtx.createGain();
+  spaceBus.gain.value = 1;
+  const dly = audioCtx.createDelay(1.0);
+  dly.delayTime.value = 0.31;
+  const fb = audioCtx.createGain();
+  fb.gain.value = 0.26;
+  const damp = audioCtx.createBiquadFilter();
+  damp.type = 'lowpass';
+  damp.frequency.value = 3400;
+  spaceBus.connect(dly);
+  dly.connect(damp);
+  damp.connect(fb);
+  fb.connect(dly);
+  damp.connect(reverb);
+  spaceBus.connect(reverb);
+}
+function setMasterVolume(v, dur){
+  if(!masterGain || !audioCtx) return;
+  const t = audioCtx.currentTime;
+  masterGain.gain.cancelScheduledValues(t);
+  masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+  masterGain.gain.linearRampToValueAtTime(v, t + (dur || 0.5));
+}
+function tone(type, freq, at, dur, peak, dest, glideTo){
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, at);
+  if(glideTo) o.frequency.exponentialRampToValueAtTime(glideTo, at + dur * 0.78);
+  g.gain.setValueAtTime(0, at);
+  g.gain.linearRampToValueAtTime(peak, at + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+  o.connect(g);
+  g.connect(dest);
+  o.start(at);
+  o.stop(at + dur + 0.2);
+  return g;
+}
+const PROG = [
+  [110.00, 220.00, 329.63, 440.00],
+  [ 87.31, 174.61, 261.63, 349.23],
+  [130.81, 261.63, 329.63, 392.00],
+  [ 98.00, 196.00, 293.66, 392.00],
+];
+const PROG_GAIN = [0.30, 0.17, 0.115, 0.08];
+const TWINKLE_SCALE = [523.25, 587.33, 659.25, 783.99, 880.00, 1046.50, 1174.66, 1318.51];
+/* ============================================================
+   【背景音乐】Am–F–C–G 四个和弦每 13 秒交叉淡化循环。
+   PROG 数组里每个和弦的四层音高、PROG_GAIN 是各层音量配比；
+   改和弦音高即可换调性（注意要和音效里的琶音保持一致）
+   ============================================================ */
+function startBGM(){
+  if(!audioCtx || bgmStarted) return;
+  bgmStarted = true;
+  const now = audioCtx.currentTime;
+  const bus = audioCtx.createGain();
+  bus.gain.setValueAtTime(0.0001, now);
+  bus.gain.linearRampToValueAtTime(0.5, now + 6);
+  bus.connect(bgmGain);
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 2600;
+  lp.Q.value = 0.4;
+  lp.connect(bus);
+  const fLfo = audioCtx.createOscillator();
+  fLfo.type = 'sine';
+  fLfo.frequency.value = 0.021;
+  const fLfoG = audioCtx.createGain();
+  fLfoG.gain.value = 900;
+  fLfo.connect(fLfoG);
+  fLfoG.connect(lp.frequency);
+  fLfo.start(now);
+  const voices = PROG.map(chord => {
+    const g = audioCtx.createGain();
+    g.gain.value = 0.0001;
+    g.connect(lp);
+    chord.forEach((f, idx) => {
+      const o = audioCtx.createOscillator();
+      o.type = idx === 0 ? 'sine' : 'triangle';
+      o.frequency.value = f;
+      const og = audioCtx.createGain();
+      og.gain.value = PROG_GAIN[idx];
+      o.connect(og);
+      og.connect(g);
+      o.start(now);
+    });
+    return g;
+  });
+  let step = 0;
+  (function cycle(){
+    if(!bgmStarted || !audioCtx) return;
+    const t = audioCtx.currentTime;
+    voices.forEach((g, idx) => {
+      g.gain.cancelScheduledValues(t);
+      g.gain.setValueAtTime(Math.max(g.gain.value, 0.0001), t);
+      g.gain.linearRampToValueAtTime(idx === step ? 0.95 : 0.0001, t + 4.5);
+    });
+    step = (step + 1) % voices.length;
+    setTimeout(cycle, 13000);
+  })();
+  const nLen = Math.floor(audioCtx.sampleRate * 4);
+  const nBuf = audioCtx.createBuffer(1, nLen, audioCtx.sampleRate);
+  const nd = nBuf.getChannelData(0);
+  let lastN = 0;
+  for(let i = 0; i < nLen; i++){
+    const w = Math.random() * 2 - 1;
+    lastN = (lastN + 0.02 * w) / 1.02;
+    nd[i] = lastN * 3.2;
+  }
+  const nSrc = audioCtx.createBufferSource();
+  nSrc.buffer = nBuf;
+  nSrc.loop = true;
+  const nFilt = audioCtx.createBiquadFilter();
+  nFilt.type = 'bandpass';
+  nFilt.frequency.value = 520;
+  nFilt.Q.value = 0.6;
+  const nSweep = audioCtx.createOscillator();
+  nSweep.type = 'sine';
+  nSweep.frequency.value = 0.013;
+  const nSweepG = audioCtx.createGain();
+  nSweepG.gain.value = 260;
+  nSweep.connect(nSweepG);
+  nSweepG.connect(nFilt.frequency);
+  nSweep.start(now);
+  const nGain = audioCtx.createGain();
+  nGain.gain.value = 0.045;
+  nSrc.connect(nFilt);
+  nFilt.connect(nGain);
+  nGain.connect(bus);
+  nSrc.start(now);
+  scheduleTwinkle();
+}
+function scheduleTwinkle(){
+  if(!bgmStarted) return;
+  setTimeout(() => {
+    if(!bgmStarted || !audioCtx) return;
+    if(soundEnabled && audioCtx.state === 'running') playTwinkle();
+    scheduleTwinkle();
+  }, 2400 + Math.random() * 6800);
+}
+function playTwinkle(){
+  if(!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const f = TWINKLE_SCALE[Math.floor(Math.random() * TWINKLE_SCALE.length)];
+  const mix = audioCtx.createGain();
+  let out = mix;
+  if(audioCtx.createStereoPanner){
+    const pan = audioCtx.createStereoPanner();
+    pan.pan.value = Math.random() * 1.6 - 0.8;
+    mix.connect(pan);
+    out = pan;
+  }
+  out.connect(masterGain);
+  out.connect(spaceBus);
+  tone('sine', f, t, 3.0, 0.085, mix);
+  tone('sine', f * 2, t, 1.6, 0.022, mix);
+}
+/* 【时代切换音】上升扫频 + A 小调琶音 + 低频冲击。
+   最后的 320 是防叠加节流（毫秒），快速拖时间轴时不会糊成一片 */
+function playEraSound(){
+  if(!audioCtx || !soundEnabled || audioCtx.state !== 'running') return;
+  const nowMs = performance.now();
+  if(nowMs - lastSfxAt < 320) return;
+  lastSfxAt = nowMs;
+  const t = audioCtx.currentTime;
+  const sweep = audioCtx.createOscillator();
+  sweep.type = 'sine';
+  sweep.frequency.setValueAtTime(220, t);
+  sweep.frequency.exponentialRampToValueAtTime(1320, t + 0.62);
+  const fifth = audioCtx.createOscillator();
+  fifth.type = 'sine';
+  fifth.frequency.setValueAtTime(330, t);
+  fifth.frequency.exponentialRampToValueAtTime(1980, t + 0.62);
+  const sFilter = audioCtx.createBiquadFilter();
+  sFilter.type = 'lowpass';
+  sFilter.frequency.setValueAtTime(900, t);
+  sFilter.frequency.exponentialRampToValueAtTime(6500, t + 0.55);
+  sFilter.Q.value = 3;
+  const sGain = audioCtx.createGain();
+  sGain.gain.setValueAtTime(0, t);
+  sGain.gain.linearRampToValueAtTime(0.14, t + 0.07);
+  sGain.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
+  sweep.connect(sFilter);
+  fifth.connect(sFilter);
+  sFilter.connect(sGain);
+  sGain.connect(sfxGain);
+  sGain.connect(spaceBus);
+  sweep.start(t); sweep.stop(t + 1.1);
+  fifth.start(t); fifth.stop(t + 1.1);
+  [880.00, 1046.50, 1318.51].forEach((f, idx) => {
+    tone('sine', f, t + 0.12 + idx * 0.058, 1.1, 0.11 / (idx + 1), sfxGain).connect(spaceBus);
+  });
+  tone('sine', 96, t, 0.9, 0.18, sfxGain, 46);
+}
+function ensureAudio(){
+  initAudio();
+  if(!audioCtx) return;
+  const go = () => { if(soundEnabled && !bgmStarted) startBGM(); };
+  if(audioCtx.state === 'suspended'){
+    audioCtx.resume().then(go).catch(() => {});
+  } else {
+    go();
+  }
+}
+const unlockAudio = () => {
+  window.removeEventListener('pointerdown', unlockAudio);
+  window.removeEventListener('touchstart', unlockAudio);
+  window.removeEventListener('keydown', unlockAudio);
+  ensureAudio();
+  soundBtnEl.classList.add('boot');
+  setTimeout(() => soundBtnEl.classList.remove('boot'), 1500);
+};
+window.addEventListener('pointerdown', unlockAudio, { passive: true });
+window.addEventListener('touchstart', unlockAudio, { passive: true });
+window.addEventListener('keydown', unlockAudio);
+soundBtnEl.addEventListener('click', e => {
+  e.stopPropagation();
+  soundEnabled = !soundEnabled;
+  soundBtnEl.classList.toggle('on', soundEnabled);
+  soundBtnEl.classList.toggle('off', !soundEnabled);
+  soundBtnEl.setAttribute('aria-pressed', soundEnabled ? 'true' : 'false');
+  if(soundEnabled){
+    ensureAudio();
+    setMasterVolume(0.9, 0.8);
+  } else {
+    setMasterVolume(0, 0.35);
+  }
+});
+const ERA_COUNT = ERA_DEFS.length;
+let eraTime = 0, playing = true, scrubbing = false, lastEraIndex = -1;
+let completed = false, completedTime = 0;
+let ending = false, endPhase = 'none', endProgress = 0, endHoldTimer = 0;
+/* 【终局动画时长】时间轴走满后点播放键触发：
+   膨胀 3 秒 → 停顿 0.6 秒 → 收缩回零 1.4 秒。
+   三个数字一起决定整段"宇宙大爆炸"的节奏 */
+const EXPAND_TIME = 3.0, HOLD_TIME = 0.6, RESET_TIME = 1.4;
+const labelLayer = document.getElementById('labels');
+const hudEra = document.getElementById('hudEra');
+const hudYear = document.getElementById('hudYear');
+const hudCount = document.getElementById('hudCount');
+const eraTitleEl = document.getElementById('eraTitle');
+const playBtn = document.getElementById('playBtn');
+/* 【播放倍速档位】点击时间轴上的倍速按钮循环切换。
+   增删数组里的数字即可改变可选的倍速档 */
+const SPEEDS = [0.5, 1, 2, 3, 4, 5];
+let speedIdx = 1;
+const speedBtnEl = document.getElementById('speedBtn');
+speedBtnEl.addEventListener('click', e => {
+  e.stopPropagation();
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  speedBtnEl.textContent = SPEEDS[speedIdx] + '×';
+});
+const track = document.getElementById('track');
+const fillEl = document.getElementById('fill');
+const knobEl = document.getElementById('knob');
+const timeTxt = document.getElementById('timeTxt');
+const ticksEl = document.getElementById('ticks');
+CATS.forEach(c => {
+  const d = document.createElement('div');
+  d.className = 'item';
+  d.innerHTML = `<span class="dot" style="background:${c.color};box-shadow:0 0 8px ${c.color}"></span>${c.name}`;
+  document.getElementById('legend').appendChild(d);
+});
+for(let i = 1; i < ERA_COUNT; i++){
+  const t = document.createElement('div');
+  t.className = 'tick';
+  t.style.left = (i / ERA_COUNT * 100) + '%';
+  ticksEl.appendChild(t);
+}
+function showEraTitle(era){
+  eraTitleEl.innerHTML = `<div class="en">${era.name}</div><div class="es">${era.range}</div><div class="ec">- 共 ${eraCounts[era.idx]} 项科技 -</div>`;
+  eraTitleEl.classList.remove('show');
+  void eraTitleEl.offsetWidth;
+  eraTitleEl.classList.add('show');
+}
+function startExplode(){
+  if(ending) return;
+  ending = true; completed = false;
+  endPhase = 'expanding'; endProgress = 0; endHoldTimer = 0;
+  labelLayer.style.opacity = '0';
+  hidePanel(); hideHoverLabel();
+  playBtn.textContent = '▶'; playBtn.classList.remove('ready');
+}
+function cancelEnding(){
+  if(!ending) return;
+  ending = false; endPhase = 'none'; endProgress = 0; endHoldTimer = 0;
+  nodeUniforms.uExpand.value = 0;
+  lineUniforms.uExpand.value = 0;
+  trailUniforms.uExpand.value = 0;
+  labelLayer.style.opacity = '1';
+}
+playBtn.addEventListener('click', () => {
+  if(ending) return;
+  if(completed){ startExplode(); return; }
+  if(eraTime >= ERA_COUNT - 0.001){ eraTime = 0; lastEraIndex = -1; }
+  playing = !playing;
+  playBtn.textContent = playing ? '❚❚' : '▶';
+});
+function trackScrub(clientX){
+  if(ending) return;
+  if(completed){ completed = false; playBtn.classList.remove('ready'); }
+  const rect = track.getBoundingClientRect();
+  eraTime = THREE.MathUtils.clamp((clientX - rect.left) / rect.width, 0, 1) * ERA_COUNT;
+  checkEraChange();
+}
+track.addEventListener('pointerdown', e => {
+  if(ending) return;
+  scrubbing = true; track.setPointerCapture(e.pointerId); trackScrub(e.clientX);
+});
+track.addEventListener('pointermove', e => { if(scrubbing) trackScrub(e.clientX); });
+track.addEventListener('pointerup', () => scrubbing = false);
+track.addEventListener('pointercancel', () => scrubbing = false);
+function checkEraChange(){
+  const ei = Math.min(ERA_COUNT - 1, Math.floor(eraTime + 1e-6));
+  if(ei !== lastEraIndex){
+    lastEraIndex = ei;
+    showEraTitle(ERA_DEFS[ei]);
+    hudEra.textContent = ERA_DEFS[ei].name;
+    playEraSound();     // ★ 进入新时代的科技音
+  }
+}
+/* ============================================================
+   【标签参数】
+   LABEL_WINDOW：新解锁标签的显示窗口（以"时代"为单位），调大=停留更久
+   MAX_LABELS  ：同时最多显示多少个新解锁标签
+   MIN_DIST_SQ ：两个标签间距小于 24px 就视为重叠、需要让位
+   ============================================================ */
+const LABEL_WINDOW = 0.02, MAX_LABELS = 30, MIN_DIST_SQ = 24 * 24;
+/* 【常显标签的同屏上限】超出这个数量的标签会在本帧放弃更新并平滑淡出。
+   视角拉远或快速切换时代时，可能有上百个标签同时进入"激活"状态，
+   每帧的坐标投影 + DOM 写入会明显掉帧。这个上限是性能保险丝。
+   调大=同屏信息更多但更卡；调小=更流畅但标签更少 */
+const MAX_MAJOR_CANDIDATES = 72;
+/* 【写 DOM 的阈值】变化小于这两个值就跳过，避免无谓的重排。
+   POS_EPS 调大会出现"一格一格"的跳动感，调小更跟手但更耗性能 */
+const OPACITY_EPS = 0.012, POS_EPS = 0.05;
+const labelMap = new Map(), labelPool = [], labelState = new Map();
+const acquireLabel = () => {
+  let el = labelPool.pop();
+  if(!el){ el = document.createElement('div'); el.className = 'tech-label'; labelLayer.appendChild(el); }
+  labelState.delete(el); el._fadeStart = undefined;
+  return el;
+};
+const recycleLabel = el => {
+  el.style.opacity = '0'; el._fadeStart = undefined;
+  labelState.delete(el); labelPool.push(el);
+};
+const hideLabel = el => {
+  const st = labelState.get(el);
+  if(st && st.o === 0) return;
+  el.style.opacity = '0';
+  if(st) st.o = 0; else labelState.set(el, { x:-99999, y:-99999, o:0 });
+};
+/* ============================================================
+   【killLabel —— v0.6 新增，修复"放大再缩小时卡标签烙印"】
+   凡是"放弃某个 major 标签"的路径，都必须走这里。
+
+   旧代码的 bug：下面几处分支在 vis 已经很小的时候直接 continue，
+   既没有调用 setLabel 也没有调用 hideLabel，于是 DOM 上那一格的
+   opacity 就**冻结在最后一帧的写入值**上，永远不再变化。
+
+   放大再缩小时，大批标签同时变成"非当前时代"并开始淡出，它们仍然
+   被推进 candidateBuf 占名额；等缩回来时候选池被这些正在衰减的旧
+   标签塞满，本该显示的标签全被挤进"超上限"分支 → continue →
+   透明度冻结。屏幕上于是出现一个个静止不动的烙印，直到下一次
+   resetAllLabels() 无条件 hideLabel 才被清掉。
+
+   现在：killLabel 会把 vis 归零、isVis 置 false，并**强制写一次 DOM**，
+   保证没有任何一条"放弃"路径会跳过 DOM 更新。
+   ============================================================ */
+const killLabel = item => {
+  item.vis = 0;
+  item.isVis = false;
+  hideLabel(item.el);
+};
+const setLabel = (el, x, y, opacity, rise) => {
+  const ry = y + (rise || 0);
+  let st = labelState.get(el);
+  if(!st){ st = { x:-99999, y:-99999, o:-1 }; labelState.set(el, st); }
+  if(Math.abs(x - st.x) > POS_EPS || Math.abs(ry - st.y) > POS_EPS){
+    el.style.transform = `translate3d(${x.toFixed(1)}px,${ry.toFixed(1)}px,0) translate(-50%,-50%)`;
+    st.x = x; st.y = ry;
+  }
+  if(Math.abs(opacity - st.o) > OPACITY_EPS){
+    el.style.opacity = opacity.toFixed(3);
+    st.o = opacity;
+  }
+};
+const majorLabels = MAJOR_INDICES.map(i => {
+  const n = NODES[i];
+  const el = document.createElement('div');
+  el.className = 'tech-label';
+  el.textContent = n.name;
+  el.style.color = n.colorCss;
+  labelLayer.appendChild(el);
+  return { node:n, el, vis:0, isVis:false };
+});
+const candidateBuf = [], placedX = [], placedY = [];
+function camDistToFocusEra(d){
+  for(let i = RING_COUNT - 1; i >= 1; i--) if(d >= RADII[i]) return i;
+  return 0;
+}
+function screenPos(n, t){
+  worldPos(n, t);
+  _v.copy(_pv).project(camera);
+  if(_v.z > 1) return null;
+  return {
+    sx: (_v.x * 0.5 + 0.5) * W,
+    sy: (-_v.y * 0.5 + 0.5) * H,
+    inView: _v.x > -1.15 && _v.x < 1.15 && _v.y > -1.15 && _v.y < 1.15
+  };
+}
+/* ============================================================
+   【清空全部标签】重新开始（进入科技树 / 返回主页 / 终局重置）时必须调用。
+   注意这里对所有标签无条件调用 killLabel —— 不能写成
+   "if(item.isVis) hideLabel(...)"，因为上一轮结束时 isVis 已经是 false，
+   条件不成立就漏掉了 DOM 上的透明度，于是重新开始时会出现旧标签烙印。
+   ============================================================ */
+function resetAllLabels(){
+  for(const [, el] of labelMap) recycleLabel(el);
+  labelMap.clear();
+  for(let k = 0; k < majorLabels.length; k++) killLabel(majorLabels[k]);
+}
+
+/* ============================================================
+   【标签系统】全文件最容易出 bug 的地方，改动前请读完。
+
+   两套并存的标签：
+     majorLabels  450 个"重大成就"标签，按时代常驻显示
+     labelMap     新解锁科技的临时标签，只在 appear 之后极短窗口内浮现
+
+   显示哪个时代 displayEra = min(当前时间所在时代, 相机距离所在球壳的时代)
+     前者保证不会显示"还没解锁"的时代；
+     后者让用户放大到某片区域时能就近看到该区域的标签。
+
+   透明度铁律（v0.6 加固）：
+     标签的可见程度**只**由 item.vis 决定（平滑增减的量）。
+     出界(sp.inView)、重叠(overlapped)、超上限 都只调整 vis，绝不再直接写 0。
+     **并且：任何"放弃这个标签"的分支，都必须真正把 DOM 写一次**
+     （要么 setLabel 写入当前透明度，要么 killLabel 归零）。
+     跳过 DOM 写入 = 透明度冻结 = 屏幕上的烙印。
+
+   重叠让位：
+     按屏幕 Y 排序后逐个占位，与已占位标签距离 < 24px 的让位。
+     让位是平滑压低 vis，不是隐藏——否则判定在阈值附近穿越时会闪烁。
+
+   名额分配：
+     只有 targetV === 1（当前时代 + 在视野内）的标签才进入 candidateBuf
+     并参与 MAX_MAJOR_CANDIDATES 计数与重叠避让。正在淡出的标签
+     只更新自己的 vis 和透明度，不占用名额——旧版本让它们占名额，
+     正是"放大再缩小卡烙印"的根源之一。
+
+   位置节流：
+     setLabel 只在位移超过 POS_EPS 时才写 DOM。过大会出现"一格一格"的跳动，
+     过小则 DOM 写入变多。0.05 是实测的平衡点。
+   ============================================================ */
+function updateLabels(currentEra, t){
+  const displayEra = Math.min(currentEra, camDistToFocusEra(camDist));
+  candidateBuf.length = 0;
+  for(let k = 0; k < majorLabels.length; k++){
+    const item = majorLabels[k], node = item.node;
+
+    /* ① 尚未解锁 —— 无条件归零 */
+    if(eraTime <= node.appear){
+      if(item.isVis || item.vis !== 0) killLabel(item);
+      continue;
+    }
+
+    /* 【显示哪个时代的标签】
+       displayEra 由"相机距离落在哪层球壳"决定（同时受当前时间限制，
+       不会显示还没解锁的时代）。TOL=0 表示只显示该时代本身。
+       曾经尝试过 TOL=1（相邻时代一起显示），但同屏标签翻三倍会明显卡顿，
+       所以退回 0。     想再试的话，记得同时调大下面的 MAX_MAJOR_CANDIDATES */
+    const TOL = 0;
+    const isThisEra = Math.abs(node.era - displayEra) <= TOL;
+
+    /* ② 不在聚焦时代且已淡透 —— 收尾归零，省一次投影 */
+    if(!isThisEra && item.vis < 0.004){
+      if(item.isVis || item.vis !== 0) killLabel(item);
+      continue;
+    }
+
+    /* ③ 投影到屏幕。在相机背后（_v.z > 1）时平滑衰减，
+          并把 DOM 立即写空，避免留下不可见的残留 */
+    const sp = screenPos(node, t);
+    if(!sp){
+      item.vis *= 0.82;
+      if(item.vis < 0.02) killLabel(item);
+      else hideLabel(item.el);
+      continue;
+    }
+
+    /* ④ 平滑推进 vis —— 可见度只由这一个量决定 */
+    const targetV = (isThisEra && sp.inView) ? 1 : 0;
+    item.vis += (targetV - item.vis) * (targetV ? 0.24 : 0.16);
+    if(item.vis > 1) item.vis = 1;
+
+    const fade = (eraTime - node.appear) < 0.55 ? (eraTime - node.appear) / 0.55 : 1;
+    const base = 0.92 * fade;
+
+    /* ⑤ 正在淡出的标签：只同步透明度，不占候选名额、不参与避让。
+          必须调用 setLabel —— 否则透明度会冻结在最后一帧 */
+    if(!targetV){
+      if(item.vis < 0.004) killLabel(item);
+      else setLabel(item.el, sp.sx, sp.sy, base * item.vis);
+      continue;
+    }
+
+    /* ⑥ 同屏上限保险丝：被挤掉的标签平滑压低透明度，
+          但**必须继续写 DOM**（旧代码在这里 continue 跳过了 setLabel，
+          于是透明度被冻结在最后一帧，放大再缩小后就会看到"烙印"） */
+    if(candidateBuf.length >= MAX_MAJOR_CANDIDATES){
+      item.vis *= 0.90;
+      if(item.vis < 0.02) killLabel(item);
+      else setLabel(item.el, sp.sx, sp.sy, base * item.vis);
+      continue;
+    }
+
+    candidateBuf.push({ el:item.el, item, sx:sp.sx, sy:sp.sy, base });
+  }
+  candidateBuf.sort((a, b) => a.sy - b.sy);
+  placedX.length = 0; placedY.length = 0;
+  for(let i = 0; i < candidateBuf.length; i++){
+    const c = candidateBuf[i];
+    let overlapped = false;
+    for(let j = 0; j < placedX.length; j++){
+      const dx = c.sx - placedX[j], dy = c.sy - placedY[j];
+      if(dx*dx + dy*dy < MIN_DIST_SQ){ overlapped = true; break; }
+    }
+    if(overlapped){
+      /* 让位：平滑压低；低于阈值时走 killLabel 把 DOM 真正归零，
+         否则同样会把透明度冻结在最后一帧 */
+      c.item.vis *= 0.87;
+      if(c.item.vis < 0.02){ killLabel(c.item); continue; }
+    } else {
+      placedX.push(c.sx); placedY.push(c.sy);
+      c.item.isVis = true;
+    }
+    setLabel(c.el, c.sx, c.sy, c.base * c.item.vis);
+  }
+  if(completed){
+    const now = performance.now() * 0.001;
+    for(const [i, el] of labelMap){
+      const n = NODES[i];
+      const sp = screenPos(n, t);
+      if(!sp){ recycleLabel(el); labelMap.delete(i); continue; }
+      const el_ = now - (el._fadeStart || completedTime);
+      let a = 1;
+      if(el_ > 0) a = Math.max(0, 1 - el_ / 0.5);
+      if(a <= 0.01 || !sp.inView){ recycleLabel(el); labelMap.delete(i); continue; }
+      setLabel(el, sp.sx, sp.sy, a);
+    }
+    return;
+  }
+  const fresh = [];
+  for(let i = 0; i < N; i++){
+    if(MAJOR_SET.has(i)) continue;
+    const d = eraTime - NODES[i].appear;
+    if(d > 0 && d < LABEL_WINDOW) fresh.push(i);
+  }
+  fresh.sort((a, b) => NODES[a].appear - NODES[b].appear);
+  const useList = fresh.length > MAX_LABELS ? fresh.slice(fresh.length - MAX_LABELS) : fresh;
+  const showSet = new Set(useList);
+  for(const [i, el] of labelMap){
+    if(!showSet.has(i)){ recycleLabel(el); labelMap.delete(i); }
+  }
+  for(let k = 0; k < useList.length; k++){
+    const i = useList[k], n = NODES[i];
+    let el = labelMap.get(i);
+    if(!el){ el = acquireLabel(); el.textContent = n.name; el.style.color = n.colorCss; labelMap.set(i, el); }
+    const sp = screenPos(n, t);
+    if(!sp){ hideLabel(el); continue; }
+    const t2 = (eraTime - n.appear) / LABEL_WINDOW;
+    let a;
+    if(t2 < 0.18) a = t2 / 0.18;
+    else if(t2 > 0.60) a = 1 - (t2 - 0.60) / 0.40;
+    else a = 1;
+    setLabel(el, sp.sx, sp.sy, sp.inView ? a : 0, 6 - 12 * t2);
+  }
+}
+let W = innerWidth, H = innerHeight;
+let hudTick = 0, lastUnlocked = -1, lastMajorUnlocked = -1, lastProgW = '', lastYearStr = '';
+/* 【窗口尺寸自适应】uScale 用来把世界尺寸换算成屏幕像素点大小，
+   改变它等于整体缩放所有光点的观感大小 */
+function resize(){
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H, false);
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  const buf = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const s = buf.y / (2 * Math.tan(camera.fov * Math.PI / 360));
+  nodeUniforms.uScale.value = s;
+  trailUniforms.uScale.value = s;
+}
+window.addEventListener('resize', resize);
+const clock = new THREE.Clock();
+let elapsed = 0;
+/* ============================================================
+   【主循环】每帧依次：推进时间轴 → 处理终局动画 → 更新相机
+   → 刷新每个光点的大小与透明度 → 更新标签 → 渲染
+   dts 被限制在 0.05 秒内，防止切回标签页时时间"跳一大步"
+   ============================================================ */
+/* ============================================================
+   【主循环执行顺序】每帧严格按此顺序，不要随意调换：
+     1. 推进 eraTime（受 playing / scrubbing / ending / 倍速影响）
+     2. 终局爆炸动画推进（expanding → holding → reset）
+     3. 相机惯性衰减 + 自动慢速旋转 + 距离平滑
+     4. HUD 年份与计数刷新（都带脏检查，避免每帧写 DOM）
+     5. 计算每个光点本帧的透明度 aArr 与尺寸 sArr（写入 GPU 属性）
+        出现动画：凝聚成核 → 爆发过冲 → 回落稳定
+     6. 连线透明度、时代圆环透明度
+     7. 更新 shader uniform（时间 / 自转 / 拖尾 / 膨胀）
+     8. updateLabels —— 必须在相机更新之后，否则标签会比场景晚一帧
+     9. renderer.render
+   ============================================================ */
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  const dts = Math.min(dt, 0.05);
+  elapsed += dts;
+  if(spinEnabled){
+    spinFactor += (1 - spinFactor) * (1 - Math.exp(-dts * 5.5));
+  } else {
+    spinFactor += (0 - spinFactor) * (1 - Math.exp(-dts * 1.15));
+    if(spinFactor < 0.0008) spinFactor = 0;
+  }
+  if(spinFactor > 0.0005) spinTime += dts * SPIN_SCALE * spinFactor;
+  if(playing && !scrubbing && !ending){
+    const ei = Math.min(ERA_COUNT - 1, Math.floor(eraTime));
+    eraTime += dts * SPEEDS[speedIdx] / eraDur[ei];
+    if(eraTime >= ERA_COUNT){ eraTime = ERA_COUNT - 0.0001; playing = false; playBtn.textContent = '▶'; }
+  }
+  if(!ending && !completed && eraTime >= ERA_COUNT - 0.001 && !playing){
+    completed = true;
+    completedTime = performance.now() * 0.001;
+    let idx = 0;
+    for(const [, el] of labelMap) el._fadeStart = completedTime + idx++ * 0.08;
+    playBtn.textContent = '▶';
+    playBtn.classList.add('ready');
+  }
+  if(ending){
+    if(endPhase === 'expanding'){
+      endProgress += dts / EXPAND_TIME;
+      if(endProgress >= 1){ endProgress = 1; endPhase = 'holding'; endHoldTimer = HOLD_TIME; }
+    } else if(endPhase === 'holding'){
+      endHoldTimer -= dts;
+      if(endHoldTimer <= 0){ endPhase = 'reset'; endHoldTimer = RESET_TIME; }
+    } else if(endPhase === 'reset'){
+      endHoldTimer -= dts;
+      endProgress *= Math.pow(0.015, dts);
+      eraTime *= Math.pow(0.02, dts);
+      if(eraTime < 0.001 || endHoldTimer <= 0){
+        eraTime = 0; endProgress = 0; ending = false; endPhase = 'none';
+        completed = false; lastEraIndex = -1;
+        userZoom = 1; camDist = 30; camTheta = 0.85; camPhi = 1.15;
+        camThetaVel = 0; camPhiVel = 0;
+        resetAllLabels();
+        labelLayer.style.opacity = '1';
+        checkEraChange(); updateCamera();
+        playing = true;
+        playBtn.textContent = '❚❚';
+        playBtn.classList.remove('ready');
+      }
+    }
+    nodeUniforms.uExpand.value = endProgress * 3500;
+    lineUniforms.uExpand.value = endProgress * 3500;
+    trailUniforms.uExpand.value = endProgress * 3500;
+  } else {
+    if(!completed) checkEraChange();
+    if(nodeUniforms.uExpand.value !== 0){
+      nodeUniforms.uExpand.value = 0;
+      lineUniforms.uExpand.value = 0;
+      trailUniforms.uExpand.value = 0;
+    }
+  }
+  if(!dragging && (camThetaVel !== 0 || camPhiVel !== 0)){
+    camTheta += camThetaVel * dts;
+    camPhi = THREE.MathUtils.clamp(camPhi + camPhiVel * dts, 0.12, Math.PI - 0.12);
+    const decay = Math.exp(-dts * 2.6);
+    camThetaVel *= decay;
+    camPhiVel *= decay;
+    if(Math.abs(camThetaVel) < 0.005) camThetaVel = 0;
+    if(Math.abs(camPhiVel) < 0.005) camPhiVel = 0;
+  }
+  const yearStr = formatYear(getYear(eraTime));
+  if(yearStr !== lastYearStr){ lastYearStr = yearStr; hudYear.textContent = yearStr; }
+  const ei = Math.min(ERA_COUNT - 1, Math.floor(eraTime));
+  const ep = THREE.MathUtils.clamp(eraTime - ei, 0, 1);
+  const curR = RADII[ei] + (RADII[ei + 1] - RADII[ei]) * ep;
+  autoRotateTimer += dts;
+  if(autoRotateTimer > 6 && !ending && !completed && spinFactor < 0.1) camTheta += dts * 0.025;
+  const baseDist = Math.max(30, curR * 2.5 + 30);
+  const targetDist = Math.max(CAM_DIST_MIN, baseDist * userZoom);
+  camDist += (targetDist - camDist) * Math.min(1, dts * (ending ? 2.0 : 3.2));
+  if(!isFinite(camDist)) camDist = 30;
+  updateCamera();
+  const sArr = nodeGeo.attributes.aSize.array;
+  const aArr = nodeGeo.attributes.aAlpha.array;
+  const endFade = ending ? Math.max(0, 1 - endProgress * 1.4) : 1;
+  for(let i = 0; i < N; i++){
+    const n = NODES[i];
+    const d = eraTime - n.appear;
+    if(d <= 0){ aArr[i] = 0; sArr[i] = 0; continue; }
+    if(d >= 0.75){ aArr[i] = endFade; sArr[i] = n.baseSize; }
+    else {
+      const k = d / 0.75;
+      const grow  = 1 - Math.pow(1 - k, 3.2);
+      const burst = Math.exp(-Math.pow(k / 0.30, 1.4));
+      const wob   = Math.exp(-k * 6.5) * Math.sin(k * 12.0) * 0.20;
+      sArr[i] = n.baseSize * grow * (1 + 1.60 * burst + wob) * endFade;
+      aArr[i] = Math.min(1.25, k * 6.0) * endFade;
+    }
+  }
+  nodeGeo.attributes.aSize.needsUpdate = true;
+  nodeGeo.attributes.aAlpha.needsUpdate = true;
+  trailGeo.attributes.aAlpha.array.set(aArr);
+  trailGeo.attributes.aAlpha.needsUpdate = true;
+  const lineEndFade = ending ? Math.max(0, 1 - endProgress * 2.2) : 1;
+  for(let k = 0; k < LINE_COUNT; k++){
+    const t = eraTime - NODES[lineVertNodeIdx[k]].appear;
+    lineAlphaData[k] = (t > 0 ? (t > 0.9 ? 1 : t / 0.9) : 0) * lineEndFade;
+  }
+  lineGeo.attributes.aAlpha.needsUpdate = true;
+  const ringEndFade = ending ? Math.max(0, 1 - endProgress * 2.5) : 1;
+  for(let i = 0; i < rings.length; i++){
+    const rg = rings[i];
+    const d = curR - rg.radius;
+    const a = (d < 0 ? 0.035 : 0.34 * Math.exp(-d / (rg.radius * 0.75 + 9)) + 0.028) * ringEndFade;
+    rg.mat.opacity = a;
+    rg.dots.opacity = a * 1.5;
+  }
+  nodeUniforms.uTime.value = elapsed;
+  nodeUniforms.uSpinTime.value = spinTime;
+  lineUniforms.uTime.value = elapsed;
+  lineUniforms.uSpinTime.value = spinTime;
+  trailUniforms.uTime.value = elapsed;
+  trailUniforms.uSpinTime.value = spinTime;
+  trailUniforms.uTrailOpacity.value = spinFactor * 0.95;
+  starMats.forEach(m => m.uniforms.uTime.value = elapsed);
+  if(ending){
+    /* 终局期间无条件清空所有 major 标签（必须走 killLabel，
+       否则 isVis 已经是 false 的标签会漏掉 DOM 上的透明度） */
+    for(let k = 0; k < majorLabels.length; k++) killLabel(majorLabels[k]);
+    for(const [, el] of labelMap) recycleLabel(el);
+    labelMap.clear();
+  } else {
+    updateLabels(Math.min(ERA_COUNT - 1, Math.floor(eraTime + 1e-6)), elapsed);
+  }
+  hudTick++;
+  if(hudTick % 6 === 0 && !ending){
+    let unlocked = 0, majorUnlocked = 0;
+    for(let i = 0; i < N; i++){
+      if(eraTime >= NODES[i].appear){ unlocked++; if(MAJOR_SET.has(i)) majorUnlocked++; }
+    }
+    if(unlocked !== lastUnlocked || majorUnlocked !== lastMajorUnlocked){
+      lastUnlocked = unlocked; lastMajorUnlocked = majorUnlocked;
+      hudCount.innerHTML = `已解锁 <b>${unlocked}</b> / ${TOTAL_TECHS} 项科技<br>重大成就 <b>${majorUnlocked}</b> / ${MAJOR_INDICES.length}`;
+    }
+  }
+  const progW = ((eraTime / ERA_COUNT) * 100).toFixed(2) + '%';
+  if(progW !== lastProgW){
+    lastProgW = progW;
+    fillEl.style.width = progW;
+    knobEl.style.left = progW;
+    timeTxt.textContent = Math.round((eraTime / ERA_COUNT) * 100) + '%';
+  }
+  renderer.render(scene, camera);
+}
+resize();
+updateCamera();
+checkEraChange();
+animate();
+(function initHome(){
+  const homeEl  = document.getElementById('homePage');
+  const statsEl = document.getElementById('homeStats');
+  const catsEl  = document.getElementById('homeCats');
+  statsEl.innerHTML = [
+    [ERA_DEFS.length,      '个时代'],
+    [CATS.length,          '大门类'],
+    [TOTAL_TECHS,          '项科技'],
+    [MAJOR_INDICES.length, '重大成就'],
+  ].map(([n, label]) =>
+    `<div class="stat"><b>${n.toLocaleString('en-US')}</b><span>${label}</span></div>`
+  ).join('');
+  catsEl.innerHTML = CATS.map(c =>
+    `<span class="cat"><i style="background:${c.color};box-shadow:0 0 8px ${c.color}"></i>${c.name}</span>`
+  ).join('');
+  playing = false;
+  lastEraIndex = 0;
+  hudEra.textContent = ERA_DEFS[0].name;
+  lastYearStr = formatYear(ERA_DEFS[0].y0);
+  hudYear.textContent = lastYearStr;
+  document.getElementById('enterBtn').addEventListener('click', function enterTree(){
+    resetAllLabels();          /* 清掉上一轮的标签，否则会出现烙印 */
+    eraTime = 0;
+    playing = true;
+    lastEraIndex = 0;
+    hudEra.textContent = ERA_DEFS[0].name;
+    playBtn.textContent = '❚❚';
+    playBtn.classList.remove('ready');
+    document.body.classList.remove('home-active');
+    showEraTitle(ERA_DEFS[0]);
+    homeEl.classList.add('leaving');
+    setTimeout(() => { homeEl.style.display = 'none'; }, 700);
+  });
+  window.__returnHome = function(){
+    hidePanel();
+    hideHoverLabel();
+    resetAllLabels();
+    playing = false;
+    document.body.classList.add('home-active');
+    homeEl.style.display = '';
+    requestAnimationFrame(() => homeEl.classList.remove('leaving'));
+  };
+})();
+document.getElementById('homeBtn').addEventListener('click', function(e){
+  e.stopPropagation();
+  window.__returnHome();
+});</script>
+<script>setTimeout(function(){if(!window.__dshReady)document.getElementById("loadWarn").style.display="block";},5000);</script>
+</body>
+</html>
